@@ -1,0 +1,39 @@
+{
+  "name": "valle-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "Vallé Advenature Park — WhatsApp AI concierge with human handover and in-WhatsApp back office",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "migrate": "node scripts/migrate.js",
+    "seed:agents": "node scripts/seed-agents.js",
+    "qr": "node scripts/make-qr.js",
+    "tunnel": "node --use-system-ca scripts/tunnel-keeper.js",
+    "webhook:set": "node scripts/set-webhook-d360.js",
+    "test": "node tests/e2e-test.mjs",
+    "test:e2e": "node tests/e2e-test.mjs",
+    "assets": "node scripts/prepare-assets.js",
+    "test:accuracy": "node tests/accuracy-qa.mjs",
+    "up": "node scripts/supervisor.js",
+    "email:assets": "node scripts/make-email-assets.js",
+    "poster": "node scripts/make-poster.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.65.0",
+    "dotenv": "^17.2.0",
+    "express": "^5.1.0",
+    "pg": "^8.16.0",
+    "pg-mem": "^3.0.14",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.35.3",
+    "pdf-parse": "^2.4.5"
+  },
+  "devDependencies": {
+    "localtunnel": "^2.0.2"
+  }
+}

@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: valle-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: valle
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: valle_bot
+    ports:
+      - '5432:5432'
+    volumes:
+      - valle_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U valle -d valle_bot']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  valle_pgdata:
