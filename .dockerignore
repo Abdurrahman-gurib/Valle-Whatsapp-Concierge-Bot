@@ -1,6 +1,7 @@
 node_modules
 source-material
-assets/marketing
 assets/qr
 .env
 *.log
+logs
+bin
