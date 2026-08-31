@@ -7,7 +7,12 @@ import { getWeather, describeWeather } from '../core/weather.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const client = new Anthropic({ apiKey: config.ai.apiKey });
+// A guest on WhatsApp waits seconds, not minutes. Without these, the SDK's
+// defaults (10-minute timeout, 2 retries) let one hanging call jam a guest's
+// message queue silently for up to half an hour: on 31 Aug a guest asked four
+// questions and got nothing at all. With them, a hang becomes the catch's
+// "technical moment" apology plus a handover to the team within ~90 seconds.
+const client = new Anthropic({ apiKey: config.ai.apiKey, timeout: 45_000, maxRetries: 1 });
 
 /** The knowledge base is read once at boot. Restart the app after editing it. */
 const KB = fs.readFileSync(

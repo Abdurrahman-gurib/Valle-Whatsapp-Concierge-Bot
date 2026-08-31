@@ -5,6 +5,13 @@ import { handleIncomingMessage, handleStaffEcho, sweepStaleHandovers } from './b
 import { mountDashboard } from './web/dashboard.js';
 import { pool } from './core/db.js';
 
+// Timestamp every log line. On 31 Aug a guest's questions went unanswered and
+// the logs could not say when anything happened; never again.
+for (const level of ['log', 'warn', 'error']) {
+  const plain = console[level].bind(console);
+  console[level] = (...args) => plain(new Date().toISOString(), ...args);
+}
+
 const app = express();
 
 // We need the RAW body to check Meta's signature, so capture it during parsing.

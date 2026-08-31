@@ -54,6 +54,15 @@ const SSH_OPTS = [
  */
 const CLOUDFLARED = path.join(ROOT, 'bin', process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared');
 
+/**
+ * The supervisor is launched at logon with a minimal PATH, where a bare 'ssh'
+ * is not found (ENOENT on 31 Aug). Resolve the binary by absolute path.
+ */
+const SSH = [
+  'C:/Windows/System32/OpenSSH/ssh.exe',
+  'C:/Program Files/Git/usr/bin/ssh.exe',
+].find((p) => fs.existsSync(p)) || 'ssh';
+
 const PROVIDERS = [
   ...(fs.existsSync(CLOUDFLARED) ? [{
     name: 'cloudflare',
@@ -65,7 +74,7 @@ const PROVIDERS = [
   }] : []),
   {
     name: 'serveo',
-    cmd: 'ssh',
+    cmd: SSH,
     args: [...SSH_OPTS, '-R', `80:localhost:${PORT}`, 'serveo.net'],
     url: /https:\/\/[a-z0-9.-]+\.serveousercontent\.com/i,
   },
@@ -74,7 +83,7 @@ const PROVIDERS = [
     // tunnels expire after 60 minutes: the process exits and is restarted.
     // Pinggy has renamed its hostnames more than once; match all of them.
     name: 'pinggy',
-    cmd: 'ssh',
+    cmd: SSH,
     args: [...SSH_OPTS, '-p', '443', '-R', `0:localhost:${PORT}`, 'a.pinggy.io'],
     url: /https:\/\/[a-z0-9-]+\.(?:run\.pinggy-free\.link|free\.pinggy\.net|a\.free\.pinggy\.link|pinggy\.link)/i,
     startTimeoutMs: 20_000,   // when pinggy answers at all it does so within seconds
@@ -137,7 +146,25 @@ function rotate(reason) {
  * crash the keeper outright and take the webhook down until someone noticed.
  * Now a failed spawn is just another reason to try again shortly.
  */
-const SPAWN_RETRY_MS = 15_000; 
+const SPAWN_RETRY_MS = 15_000;
+
+/**
+ * A spawn failure has two very different meanings. ENOENT means this
+ * provider's binary is not reachable from this process (ssh missing from the
+ * PATH, cloudflared not downloaded): retrying it forever would hold the
+ * webhook hostage, as it did on 31 Aug — rotate to the next provider at once.
+ * Anything else (EPERM while Windows blocks all process creation) would fail
+ * for every provider alike, so retry the same one shortly.
+ */
+function onSpawnFailure(p, err) {
+  const code = err.code || err.message;
+  if (err.code === 'ENOENT') {
+    rotate(`${p.name} binary not found (ENOENT)`);
+    return;
+  }
+  log(`could not start ${p.name} (${code}) — retrying in ${SPAWN_RETRY_MS / 1000} s`);
+  setTimeout(start, SPAWN_RETRY_MS);
+} 
 
 function start() {
   const p = PROVIDERS[providerIndex];
@@ -145,9 +172,8 @@ function start() {
   try {
     child = spawn(p.cmd, p.args);
   } catch (err) {
-    log(`could not start ${p.name} (${err.code || err.message}) — retrying in ${SPAWN_RETRY_MS / 1000} s`);
     child = null;
-    setTimeout(start, SPAWN_RETRY_MS);
+    onSpawnFailure(p, err);
     return;
   }
   const mine = child;
@@ -156,12 +182,11 @@ function start() {
   // and an unhandled one kills the process.
   child.on('error', (err) => {
     if (mine !== child) return;
-    log(`${p.name} spawn error (${err.code || err.message}) — retrying in ${SPAWN_RETRY_MS / 1000} s`);
     clearTimeout(starting);
     starting = null;
     child = null;
     current = null;
-    setTimeout(start, SPAWN_RETRY_MS);
+    onSpawnFailure(p, err);
   });
 
   const onData = async (buf) => {
