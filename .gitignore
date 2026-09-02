@@ -24,3 +24,4 @@ db/*.backup.json
 # tunnel binaries (55 MB): download cloudflared-windows-amd64.exe from
 # github.com/cloudflare/cloudflared/releases into bin/cloudflared.exe
 bin/
+railway-variables.txt
