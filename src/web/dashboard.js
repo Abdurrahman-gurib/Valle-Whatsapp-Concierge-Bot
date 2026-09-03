@@ -13,6 +13,9 @@
  * DASHBOARD_KEY is set in .env. Keep the link private: it shows guest
  * numbers and can send email as marketing@.
  */
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { q } from '../core/db.js';
 import * as db from '../core/db.js';
 import { config } from '../core/config.js';
@@ -22,7 +25,21 @@ const TZ = config.bot.timezone;
 
 const authed = (req) => config.dashboardKey && req.query.key === config.dashboardKey;
 
+// Chart.js is served from the app itself: the park's office network blocks
+// some CDNs (proven on 3 Sept — tables rendered, charts never did), and the
+// dashboard must not depend on a third party being reachable.
+const CHART_JS = fs.readFileSync(path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..', '..', 'node_modules', 'chart.js', 'dist', 'chart.umd.js'
+));
+
 export function mountDashboard(app) {
+  app.get('/dashboard/chart.js', (_req, res) => {
+    res.set('Content-Type', 'application/javascript');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(CHART_JS);
+  });
+
   app.get('/dashboard', (req, res) => {
     if (!authed(req)) return res.sendStatus(403);
     res.send(PAGE);
@@ -166,7 +183,7 @@ const PAGE = `<!doctype html>
 <title>Vallé Concierge — Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@1,800&family=Work+Sans:wght@400;500;600&family=Chivo+Mono:wght@400;600&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script src="/dashboard/chart.js"></script>
 <style>
   :root{
     --purple:#340057; --scarlet:#FF3358; --indigo:#7333FF; --yellow:#FFFC33;
@@ -335,7 +352,10 @@ async function load() {
     D = await r.json();
   } catch (e) { toast('Could not refresh data (' + e.message + ')', true); return; }
   document.getElementById('updated').textContent = 'Live · updated ' + when(D.now) + ' (Mauritius time)';
-  tiles(); drawCharts(); renderRows(); renderWaiting(); renderLeads(); renderFeed();
+  tiles(); renderRows(); renderWaiting(); renderLeads(); renderFeed();
+  // Charts come last and must never take the tables down with them: if the
+  // Chart.js CDN is unreachable, the dashboard still works without graphs.
+  try { if (typeof Chart !== 'undefined') drawCharts(); } catch (e) { console.warn('charts skipped:', e); }
   document.getElementById('emailAll').disabled = !D.emailEnabled;
 }
 

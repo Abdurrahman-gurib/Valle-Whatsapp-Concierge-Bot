@@ -25,13 +25,14 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.65.0",
+    "chart.js": "^4.4.4",
     "dotenv": "^17.2.0",
     "express": "^5.1.0",
+    "pdf-parse": "^2.4.5",
     "pg": "^8.16.0",
     "pg-mem": "^3.0.14",
     "qrcode": "^1.5.4",
-    "sharp": "^0.35.3",
-    "pdf-parse": "^2.4.5"
+    "sharp": "^0.35.3"
   },
   "devDependencies": {
     "localtunnel": "^2.0.2"
