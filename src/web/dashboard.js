@@ -41,7 +41,9 @@ export function mountDashboard(app) {
   });
 
   app.get('/dashboard', (req, res) => {
-    if (!authed(req)) return res.sendStatus(403);
+    // A colleague following the bare link (the user guide prints it without
+    // the key on purpose) gets a friendly gate instead of "Forbidden".
+    if (!authed(req)) return res.status(403).send(GATE);
     res.send(PAGE);
   });
 
@@ -171,6 +173,32 @@ export function mountDashboard(app) {
     }
   });
 }
+
+/* ══════════════ the access gate (wrong or missing key) ══════════════ */
+
+const GATE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vallé Concierge — Access</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@1,800&family=Work+Sans:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       background:#340057;font:15px 'Work Sans',system-ui,sans-serif;color:#22133A}
+  .card{background:#F7F4EF;border-radius:18px;padding:34px 36px;max-width:380px;width:calc(100% - 40px);text-align:center}
+  .brand{font:italic 800 30px/0.85 Barlow,sans-serif;color:#340057;transform:rotate(-4deg);display:inline-block}
+  .brand small{display:block;font:italic 800 10px/1.8 Barlow,sans-serif;letter-spacing:.4em;color:#7333FF}
+  p{color:#6E6280;font-size:13.5px;margin:14px 0 18px}
+  input{width:100%;padding:11px 14px;border:1px solid #D8D2E6;border-radius:10px;font:inherit;text-align:center}
+  button{width:100%;margin-top:10px;padding:11px;border:0;border-radius:10px;background:#FF3358;
+         color:#fff;font:600 14px 'Work Sans';cursor:pointer}
+</style></head><body><div class="card">
+  <span class="brand">VALLÉ<small>ADVENATURE&nbsp;PARK</small></span>
+  <p>This is the team dashboard of the Vallé WhatsApp Concierge.<br>Enter the access key to continue.</p>
+  <form onsubmit="location.href='/dashboard?key='+encodeURIComponent(document.getElementById('k').value.trim());return false">
+    <input id="k" type="password" placeholder="access key" autofocus>
+    <button>Open the dashboard</button>
+  </form>
+</div></body></html>`;
 
 /* ═══════════════════════ the app shell ═══════════════════════ */
 /* Vallé Brand Guidelines V2: Barlow ExtraBold Italic headlines on the 4°
