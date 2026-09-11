@@ -58,7 +58,7 @@ export function mountDashboard(app) {
     if (!authed(req)) return res.sendStatus(403);
     try {
       const [stats, series, scans, hourlyScans, hourlyMsgs, scanEvents, outAuthors, msgTypes, avgReply,
-             waiting, leads, contacts, messages] = await Promise.all([
+             perAgent, unanswered, deleted, waiting, leads, contacts, messages] = await Promise.all([
         q(`SELECT
              (SELECT count(*) FROM contacts)                                                        AS total_contacts,
              (SELECT count(*) FROM contacts WHERE source IS NOT NULL)                               AS qr_scans,
@@ -95,6 +95,25 @@ export function mountDashboard(app) {
                      author, lag(direction) OVER w AS prev_dir
                 FROM messages WINDOW w AS (PARTITION BY contact_id ORDER BY created_at, id)
             ) x WHERE author = 'bot' AND prev_dir = 'in' AND gap BETWEEN 0 AND 300`),
+        q(`SELECT COALESCE(a.name, CASE WHEN m.author_wa_id = 'app'
+                    THEN 'WhatsApp Business app (shared)' ELSE COALESCE(m.author_wa_id, 'unknown') END) AS name,
+                  count(*) FILTER (WHERE m.created_at > now() - interval '14 days') AS replies_14d,
+                  count(*) AS replies_total,
+                  count(DISTINCT m.contact_id) AS chats,
+                  max(m.created_at) AS last_active
+             FROM messages m LEFT JOIN agents a ON a.wa_id = m.author_wa_id
+            WHERE m.direction = 'out' AND m.author = 'agent'
+            GROUP BY 1 ORDER BY 3 DESC`),
+        q(`SELECT c.wa_id, c.profile_name, c.source, c.mode, m.created_at AS since
+             FROM contacts c
+             JOIN LATERAL (SELECT created_at, direction FROM messages
+                            WHERE contact_id = c.id AND author <> 'system'
+                            ORDER BY created_at DESC LIMIT 1) m ON true
+            WHERE m.direction = 'in' AND m.created_at < now() - interval '15 minutes'
+            ORDER BY m.created_at ASC LIMIT 50`),
+        q(`SELECT count(*) AS total,
+                  count(*) FILTER (WHERE created_at > now() - interval '14 days') AS d14
+             FROM messages WHERE msg_type = 'revoke'`),
         q(`SELECT wa_id, profile_name, source, last_seen_at FROM contacts
             WHERE mode = 'waiting' ORDER BY last_seen_at ASC LIMIT 50`),
         q(`SELECT l.created_at, l.full_name, l.pax, l.visit_date, l.interest, c.profile_name, c.wa_id
@@ -119,6 +138,9 @@ export function mountDashboard(app) {
         outAuthors: outAuthors.rows,
         msgTypes: msgTypes.rows,
         avgReply: avgReply.rows[0]?.s ?? null,
+        perAgent: perAgent.rows,
+        unanswered: unanswered.rows,
+        deleted: deleted.rows[0],
         waiting: waiting.rows,
         leads: leads.rows,
         contacts: contacts.rows,
@@ -465,6 +487,15 @@ const PAGE = `<!doctype html>
     <div class="panel" style="grid-column:1/-1"><h3>Conversation load · guests, AI and team per day</h3><div class="cv"><canvas id="chAiTeam"></canvas></div></div>
   </div>
 
+  <h2>Team performance</h2>
+  <div class="charts">
+    <div class="panel"><h3>Replies by responder · last 14 days</h3><div class="cv"><canvas id="chAgents"></canvas></div></div>
+    <div class="panel"><h3>Responders · all time</h3><div id="agents" style="overflow-x:auto"></div></div>
+  </div>
+
+  <h2>Awaiting a reply</h2>
+  <div class="card" id="unanswered"></div>
+
   <h2>Guests</h2>
   <div class="bar">
     <input type="search" id="q" placeholder="Search name, number or email…">
@@ -525,7 +556,7 @@ async function load() {
     D = await r.json();
   } catch (e) { toast('Could not refresh data (' + e.message + ')', true); return; }
   document.getElementById('updated').textContent = 'Live · updated ' + when(D.now) + ' (Mauritius time)';
-  tiles(); renderRows(); renderWaiting(); renderLeads(); renderFeed();
+  tiles(); renderRows(); renderWaiting(); renderLeads(); renderFeed(); renderTeam(); renderUnanswered();
   // Charts come last and must never take the tables down with them: if the
   // Chart.js CDN is unreachable, the dashboard still works without graphs.
   try { if (typeof Chart !== 'undefined') drawCharts(); } catch (e) { console.warn('charts skipped:', e); }
@@ -550,7 +581,9 @@ function tiles() {
     t(s.waiting,'Waiting', s.waiting > 0 ? 'warn' : '') + t(s.msgs_24h,'Messages 24 h') +
     t(s.leads_total,'Leads') + t(s.emails_captured,'Emails captured') + t(s.emails_sent,'Overviews sent','go') +
     t(peak ? peak + ':00' : '·','Peak scan hour','go') + t(busyLabel,'Busiest day') +
-    t(D.avgReply != null ? D.avgReply + ' s' : '·','Avg AI reply time','go');
+    t(D.avgReply != null ? D.avgReply + ' s' : '·','Avg AI reply time','go') +
+    t(D.unanswered.length,'Awaiting reply', D.unanswered.length > 0 ? 'warn' : 'go') +
+    t(D.deleted.d14,'Deleted msgs 14 d');
 }
 
 function drawCharts() {
@@ -676,6 +709,38 @@ function drawCharts() {
   const types = D.msgTypes.map((r) => [TYPE_LABELS[r.type] || r.type, Number(r.n)]);
   mk('chTypes', donut(types.map(([k]) => k), types.map(([, n]) => n),
     [C.purple, C.scarlet, C.indigo, '#0F7A3D', '#B8860B', C.green, C.yellow, C.dim]));
+
+  // Replies per responder, the AI concierge included for scale. WhatsApp does
+  // not say which colleague typed inside the shared app, so app replies are
+  // one honest bucket; named rows are back-office agents.
+  const ai14 = D.outAuthors.filter((r) => r.author === 'bot').reduce((s, r) => s + Number(r.n), 0);
+  const resp = [['AI concierge', ai14], ...D.perAgent.map((a) => [a.name, Number(a.replies_14d)])]
+    .filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]);
+  mk('chAgents', { type: 'bar', data: { labels: resp.map(([k]) => k),
+      datasets: [{ data: resp.map(([, n]) => n),
+        backgroundColor: resp.map(([k]) => k === 'AI concierge' ? C.indigo : C.scarlet), borderRadius: 4 }]},
+    options: { ...base, indexAxis: 'y', plugins: { legend: { display: false } },
+      scales: { x: { ticks: { precision: 0 } }, y: { grid: { display: false } } } } });
+}
+
+function renderTeam() {
+  const a = D.perAgent;
+  document.getElementById('agents').innerHTML = a.length ? \`<table style="min-width:0">
+    <thead><tr><th>Responder</th><th>14 days</th><th>Total</th><th>Chats</th><th>Last active</th></tr></thead><tbody>\${
+    a.map((x) => \`<tr><td>\${esc(x.name)}</td><td class="num">\${x.replies_14d}</td>
+      <td class="num">\${x.replies_total}</td><td class="num">\${x.chats}</td><td class="num">\${when(x.last_active)}</td></tr>\`).join('')
+    }</tbody></table>\` : '<div class="empty">No human replies recorded yet.</div>';
+}
+
+function renderUnanswered() {
+  const u = D.unanswered;
+  document.getElementById('unanswered').innerHTML = u.length ? \`<table>
+    <thead><tr><th>Guest</th><th>Number</th><th>Source</th><th>Mode</th><th>Last message, no reply since</th></tr></thead><tbody>\${
+    u.map((c) => \`<tr><td>\${esc(c.profile_name || c.wa_id)}</td><td class="num">\${esc(c.wa_id)}</td>
+      <td>\${c.source ? pill(c.source, '#14432A') : '<span class="dim">·</span>'}</td>
+      <td>\${pill(c.mode, MODE_COLORS[c.mode] || C.dim)}</td>
+      <td class="num">\${when(c.since)}</td></tr>\`).join('')
+    }</tbody></table>\` : '<div class="empty">Every conversation has an answer. Nothing is waiting.</div>';
 }
 
 function filtered() {
