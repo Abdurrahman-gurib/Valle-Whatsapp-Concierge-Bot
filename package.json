@@ -27,6 +27,7 @@
     "@anthropic-ai/sdk": "^0.65.0",
     "chart.js": "^4.4.4",
     "dotenv": "^17.2.0",
+    "exceljs": "^4.4.0",
     "express": "^5.1.0",
     "pdf-parse": "^2.4.5",
     "pg": "^8.16.0",

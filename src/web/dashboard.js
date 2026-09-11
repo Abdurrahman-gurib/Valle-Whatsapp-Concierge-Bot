@@ -16,6 +16,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ExcelJS from 'exceljs';
 import { q } from '../core/db.js';
 import * as db from '../core/db.js';
 import { config } from '../core/config.js';
@@ -50,7 +51,7 @@ export function mountDashboard(app) {
   app.get('/dashboard/data', async (req, res) => {
     if (!authed(req)) return res.sendStatus(403);
     try {
-      const [stats, series, scans, waiting, leads, contacts, messages] = await Promise.all([
+      const [stats, series, scans, hourlyScans, hourlyMsgs, waiting, leads, contacts, messages] = await Promise.all([
         q(`SELECT
              (SELECT count(*) FROM contacts)                                                        AS total_contacts,
              (SELECT count(*) FROM contacts WHERE source IS NOT NULL)                               AS qr_scans,
@@ -66,6 +67,11 @@ export function mountDashboard(app) {
             GROUP BY 1, 2 ORDER BY 1`, [TZ]),
         q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day, count(*) AS n
              FROM contacts WHERE source IS NOT NULL AND created_at > now() - interval '14 days'
+            GROUP BY 1 ORDER BY 1`, [TZ]),
+        q(`SELECT to_char(created_at AT TIME ZONE $1, 'HH24') AS hour, count(*) AS n
+             FROM contacts WHERE source IS NOT NULL GROUP BY 1 ORDER BY 1`, [TZ]),
+        q(`SELECT to_char(created_at AT TIME ZONE $1, 'HH24') AS hour, count(*) AS n
+             FROM messages WHERE direction = 'in' AND created_at > now() - interval '14 days'
             GROUP BY 1 ORDER BY 1`, [TZ]),
         q(`SELECT wa_id, profile_name, source, last_seen_at FROM contacts
             WHERE mode = 'waiting' ORDER BY last_seen_at ASC LIMIT 50`),
@@ -85,6 +91,8 @@ export function mountDashboard(app) {
         stats: stats.rows[0],
         series: series.rows,
         scans: scans.rows,
+        hourlyScans: hourlyScans.rows,
+        hourlyMsgs: hourlyMsgs.rows,
         waiting: waiting.rows,
         leads: leads.rows,
         contacts: contacts.rows,
@@ -93,6 +101,101 @@ export function mountDashboard(app) {
     } catch (err) {
       console.error('[dashboard] data', err);
       res.status(500).json({ error: 'query failed' });
+    }
+  });
+
+  // Excel report: every QR guest with number and exact scan time, the daily
+  // timeline, and the hour-of-day profile with the peak marked.
+  app.get('/dashboard/report.xlsx', async (req, res) => {
+    if (!authed(req)) return res.sendStatus(403);
+    try {
+      const [guests, daily, hourly] = await Promise.all([
+        q(`SELECT profile_name, wa_id, email, email_at, source, mode,
+                  created_at, last_seen_at
+             FROM contacts WHERE source IS NOT NULL ORDER BY created_at ASC`),
+        q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day,
+                  count(*) FILTER (WHERE source IS NOT NULL) AS scans
+             FROM contacts GROUP BY 1 ORDER BY 1`, [TZ]),
+        q(`SELECT to_char(created_at AT TIME ZONE $1, 'HH24') AS hour, count(*) AS n
+             FROM contacts WHERE source IS NOT NULL GROUP BY 1 ORDER BY 1`, [TZ]),
+      ]);
+      const msgDaily = await q(
+        `SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day,
+                count(*) FILTER (WHERE direction = 'in')  AS from_guests,
+                count(*) FILTER (WHERE direction = 'out') AS replies
+           FROM messages GROUP BY 1 ORDER BY 1`, [TZ]);
+
+      const local = (d) => new Intl.DateTimeFormat('en-GB', {
+        timeZone: TZ, day: '2-digit', month: 'short', year: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      }).format(new Date(d));
+
+      const wb = new ExcelJS.Workbook();
+      wb.creator = 'Vallé WhatsApp Concierge';
+      const head = (ws) => {
+        ws.getRow(1).eachCell((c) => {
+          c.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+          c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF340057' } };
+        });
+        ws.views = [{ state: 'frozen', ySplit: 1 }];
+      };
+
+      const g = wb.addWorksheet('QR guests');
+      g.columns = [
+        { header: 'Guest', key: 'name', width: 26 },
+        { header: 'Number', key: 'num', width: 16 },
+        { header: 'Email', key: 'email', width: 30 },
+        { header: 'Overview emailed', key: 'sent', width: 19 },
+        { header: 'Source', key: 'src', width: 16 },
+        { header: 'Scanned (Mauritius time)', key: 'scan', width: 22 },
+        { header: 'Last seen', key: 'seen', width: 19 },
+      ];
+      for (const c of guests.rows) {
+        g.addRow({ name: c.profile_name || '', num: c.wa_id, email: c.email || '',
+          sent: c.email_at ? local(c.email_at) : '', src: c.source,
+          scan: local(c.created_at), seen: local(c.last_seen_at) });
+      }
+      head(g);
+
+      const t = wb.addWorksheet('Daily timeline');
+      t.columns = [
+        { header: 'Date', key: 'day', width: 14 },
+        { header: 'QR scans', key: 'scans', width: 11 },
+        { header: 'Guest messages', key: 'in', width: 16 },
+        { header: 'Replies', key: 'out', width: 11 },
+      ];
+      const msgByDay = new Map(msgDaily.rows.map((r) => [r.day, r]));
+      const dayRows = new Map(daily.rows.map((r) => [r.day, Number(r.scans)]));
+      for (const day of new Set([...dayRows.keys(), ...msgByDay.keys()])) {
+        const m = msgByDay.get(day) || {};
+        t.addRow({ day, scans: dayRows.get(day) || 0,
+          in: Number(m.from_guests || 0), out: Number(m.replies || 0) });
+      }
+      head(t);
+
+      const h = wb.addWorksheet('Hourly profile');
+      h.columns = [
+        { header: 'Hour (Mauritius time)', key: 'hour', width: 20 },
+        { header: 'QR scans', key: 'n', width: 11 },
+        { header: '', key: 'peak', width: 10 },
+      ];
+      const byHour = new Map(hourly.rows.map((r) => [r.hour, Number(r.n)]));
+      const max = Math.max(0, ...byHour.values());
+      for (let i = 0; i < 24; i++) {
+        const hh = String(i).padStart(2, '0');
+        const n = byHour.get(hh) || 0;
+        h.addRow({ hour: `${hh}:00`, n, peak: n === max && n > 0 ? 'PEAK' : '' });
+      }
+      head(h);
+
+      res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.set('Content-Disposition',
+        `attachment; filename="valle-qr-report-${new Date().toISOString().slice(0, 10)}.xlsx"`);
+      await wb.xlsx.write(res);
+      res.end();
+    } catch (err) {
+      console.error('[dashboard] report', err);
+      res.status(500).send('report failed');
     }
   });
 
@@ -135,7 +238,7 @@ export function mountDashboard(app) {
       if (!address) return res.status(400).json({ error: 'no email on file for this guest' });
 
       const ok = await sendOverviewEmail({ to: address, name: contact.profile_name });
-      if (!ok) return res.status(502).json({ error: 'send failed — check server logs' });
+      if (!ok) return res.status(502).json({ error: 'send failed, check the server logs' });
       await db.markEmailSent(waId);
       console.log(`[dashboard] overview emailed to ${address} for ${waId} (by back office)`);
       res.json({ ok: true, email: address });
@@ -179,7 +282,7 @@ export function mountDashboard(app) {
 const GATE = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Vallé Concierge — Access</title>
+<title>Vallé Concierge Access</title>
 <link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@1,800&family=Work+Sans:wght@400;600&display=swap" rel="stylesheet">
 <style>
   body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
@@ -208,7 +311,7 @@ const GATE = `<!doctype html>
 const PAGE = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Vallé Concierge — Dashboard</title>
+<title>Vallé Concierge Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@1,800&family=Work+Sans:wght@400;500;600&family=Chivo+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="/dashboard/chart.js"></script>
@@ -219,11 +322,13 @@ const PAGE = `<!doctype html>
     --paper:#F7F4EF; --card:#FFFFFF; --line:#E6E0D6;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.5 'Work Sans',system-ui,sans-serif}
+  body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.5 'Work Sans',system-ui,sans-serif;
+       -webkit-font-smoothing:antialiased}
   .num,.mono{font-family:'Chivo Mono',monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
+  :is(input,select,button):focus-visible{outline:3px solid #C9B8FF;outline-offset:1px}
 
   /* header on the Slope */
-  header{background:var(--purple);color:#fff;padding:26px 22px 40px;position:relative;overflow:hidden}
+  header{background:linear-gradient(115deg,var(--purple) 55%,#46007A);color:#fff;padding:26px 22px 40px;position:relative;overflow:hidden}
   header::after{content:'';position:absolute;left:-2%;right:-2%;bottom:-26px;height:52px;background:var(--paper);transform:rotate(-2deg)}
   header .lines{position:absolute;right:-40px;top:-30px;width:280px;height:200px;opacity:.55;
     background:repeating-linear-gradient(115deg,transparent 0 26px,var(--indigo) 26px 34px)}
@@ -239,7 +344,10 @@ const PAGE = `<!doctype html>
 
   /* KPI tiles */
   .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:12px;margin-top:-14px;position:relative}
-  .tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:13px 15px;border-bottom:4px solid var(--indigo)}
+  .tile{background:var(--card);border:1px solid #EFEAE0;border-radius:16px;padding:13px 15px;border-bottom:4px solid var(--indigo);
+        box-shadow:0 1px 2px rgba(34,19,58,.04),0 10px 28px -18px rgba(34,19,58,.25);
+        transition:transform .15s,box-shadow .15s}
+  .tile:hover{transform:translateY(-2px);box-shadow:0 2px 4px rgba(34,19,58,.05),0 16px 34px -18px rgba(34,19,58,.3)}
   .tile .n{font:600 25px 'Chivo Mono',monospace;color:var(--purple)}
   .tile .l{font-size:11px;color:var(--dim);letter-spacing:.07em;text-transform:uppercase;font-weight:600}
   .tile.warn{border-bottom-color:var(--scarlet)} .tile.warn .n{color:var(--scarlet)}
@@ -247,9 +355,9 @@ const PAGE = `<!doctype html>
 
   /* charts */
   .charts{display:grid;grid-template-columns:2fr 1fr;gap:14px}
-  .charts .panel:nth-child(3){grid-column:1}
   @media(max-width:860px){.charts{grid-template-columns:1fr}}
-  .panel{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
+  .panel{background:var(--card);border:1px solid #EFEAE0;border-radius:16px;padding:14px;
+         box-shadow:0 1px 2px rgba(34,19,58,.04),0 10px 28px -18px rgba(34,19,58,.25)}
   .panel h3{margin:0 0 8px;font:600 12px 'Work Sans';color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
   .panel .cv{position:relative;height:210px}
 
@@ -257,15 +365,19 @@ const PAGE = `<!doctype html>
   .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 10px}
   .bar input[type=search]{flex:1;min-width:190px;padding:9px 13px;border:1px solid var(--line);border-radius:10px;font:inherit;background:#fff}
   .bar select{padding:9px 10px;border:1px solid var(--line);border-radius:10px;font:inherit;background:#fff;color:var(--ink)}
-  .btn{border:0;border-radius:10px;padding:9px 14px;font:600 13px 'Work Sans';cursor:pointer;white-space:nowrap}
+  .btn{border:0;border-radius:11px;padding:9px 14px;font:600 13px 'Work Sans';cursor:pointer;white-space:nowrap;
+       transition:transform .12s,box-shadow .12s,opacity .12s}
+  .btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 6px 16px -8px rgba(34,19,58,.4)}
   .btn.primary{background:var(--purple);color:#fff}
   .btn.hot{background:var(--scarlet);color:#fff}
+  .btn.go{background:#0F7A3D;color:#fff}
   .btn.ghost{background:var(--lavender);color:var(--purple)}
   .btn:disabled{opacity:.5;cursor:default}
   .count{font-size:12px;color:var(--dim);margin-left:auto}
 
   /* tables */
-  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow-x:auto}
+  .card{background:var(--card);border:1px solid #EFEAE0;border-radius:16px;overflow-x:auto;
+        box-shadow:0 1px 2px rgba(34,19,58,.04),0 10px 28px -18px rgba(34,19,58,.25)}
   table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:680px}
   th{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);text-align:left;font-weight:600}
   th,td{padding:9px 14px;border-top:1px solid #F0EDE5;vertical-align:middle}
@@ -315,10 +427,12 @@ const PAGE = `<!doctype html>
 
   <h2>Activity</h2>
   <div class="charts">
-    <div class="panel"><h3>Messages per day — 14 days</h3><div class="cv"><canvas id="chMsgs"></canvas></div></div>
+    <div class="panel"><h3>Messages per day · last 14 days</h3><div class="cv"><canvas id="chMsgs"></canvas></div></div>
     <div class="panel"><h3>Guests by source</h3><div class="cv"><canvas id="chSrc"></canvas></div></div>
-    <div class="panel"><h3>QR scans per day — 14 days</h3><div class="cv"><canvas id="chScans"></canvas></div></div>
+    <div class="panel"><h3>QR scans per day · last 14 days</h3><div class="cv"><canvas id="chScans"></canvas></div></div>
     <div class="panel"><h3>Chats by mode</h3><div class="cv"><canvas id="chMode"></canvas></div></div>
+    <div class="panel"><h3>Activity by hour of day · scans and guest messages</h3><div class="cv"><canvas id="chHours"></canvas></div></div>
+    <div class="panel"><h3>Guests by country</h3><div class="cv"><canvas id="chCountry"></canvas></div></div>
   </div>
 
   <h2>Guests</h2>
@@ -328,8 +442,9 @@ const PAGE = `<!doctype html>
     <select id="fMode"><option value="">Mode: all</option><option value="bot">bot</option><option value="human">human</option><option value="waiting">waiting</option><option value="paused">paused</option><option value="__needs">needs a person</option></select>
     <select id="fEmail"><option value="">Email: all</option><option value="has">captured</option><option value="sent">overview sent</option><option value="unsent">captured, not sent</option><option value="none">none</option></select>
     <select id="fWhen"><option value="">Seen: any time</option><option value="1">today</option><option value="7">last 7 days</option></select>
+    <button class="btn go" id="xlsx" title="Excel workbook: every QR guest with number and scan time, the daily timeline, and the hourly profile with the peak">📊 Excel report</button>
     <button class="btn ghost" id="csv">⬇ CSV</button>
-    <button class="btn ghost" onclick="window.print()">🖨 Report</button>
+    <button class="btn ghost" onclick="window.print()">🖨 Print</button>
     <button class="btn hot" id="emailAll" title="Overview email to every QR guest with a captured address who has not received it">📧 Email all ATM scans</button>
     <span class="count" id="count"></span>
   </div>
@@ -389,11 +504,22 @@ async function load() {
 
 function tiles() {
   const s = D.stats;
+  // Peak scan hour across the whole campaign, and the busiest day of the
+  // last 14 by total messages.
+  let peak = null, peakN = 0;
+  for (const r of D.hourlyScans) if (Number(r.n) > peakN) { peakN = Number(r.n); peak = r.hour; }
+  const byDay = {};
+  for (const r of D.series) byDay[r.day] = (byDay[r.day] || 0) + Number(r.n);
+  let busyDay = null, busyN = 0;
+  for (const [d, n] of Object.entries(byDay)) if (n >= busyN) { busyN = n; busyDay = d; }
+  const busyLabel = busyDay ? new Date(busyDay + 'T12:00:00').toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }) : '·';
+
   const t = (n, l, cls='') => \`<div class="tile \${cls}"><div class="n num">\${n}</div><div class="l">\${l}</div></div>\`;
   document.getElementById('tiles').innerHTML =
     t(s.total_contacts,'Guests') + t(s.qr_scans,'QR scans','go') + t(s.active_24h,'Active 24 h') +
     t(s.waiting,'Waiting 🔔', s.waiting > 0 ? 'warn' : '') + t(s.msgs_24h,'Messages 24 h') +
-    t(s.leads_total,'Leads') + t(s.emails_captured,'Emails captured') + t(s.emails_sent,'Overviews sent','go');
+    t(s.leads_total,'Leads') + t(s.emails_captured,'Emails captured') + t(s.emails_sent,'Overviews sent','go') +
+    t(peak ? peak + ':00' : '·','Peak scan hour','go') + t(busyLabel,'Busiest day');
 }
 
 function drawCharts() {
@@ -410,12 +536,15 @@ function drawCharts() {
     byMode[m] = (byMode[m] || 0) + 1;
   }
 
+  Chart.defaults.font.family = "'Work Sans', system-ui, sans-serif";
+  Chart.defaults.color = C.dim;
+  Chart.defaults.borderColor = '#F0EAF8';
   const mk = (id, cfg) => { charts[id]?.destroy(); charts[id] = new Chart(document.getElementById(id), cfg); };
   const base = { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { boxWidth: 12, font: { size: 11 } } } } };
 
   mk('chMsgs', { type: 'bar', data: { labels: short, datasets: [
-      { label: 'from guests', data: series('in'),  backgroundColor: C.indigo,  stack: 's' },
-      { label: 'replies',     data: series('out'), backgroundColor: C.scarlet, stack: 's' }]},
+      { label: 'from guests', data: series('in'),  backgroundColor: C.indigo,  stack: 's', borderRadius: 5 },
+      { label: 'replies',     data: series('out'), backgroundColor: C.scarlet, stack: 's', borderRadius: 5 }]},
     options: { ...base, scales: { x: { stacked: true, grid: { display: false } }, y: { stacked: true, ticks: { precision: 0 } } } } });
 
   mk('chScans', { type: 'line', data: { labels: short, datasets: [
@@ -428,6 +557,42 @@ function drawCharts() {
   mk('chSrc',  donut(Object.keys(bySrc),  Object.values(bySrc),  [C.green, C.purple, C.scarlet, C.yellow, C.indigo]));
   mk('chMode', donut(Object.keys(byMode), Object.values(byMode),
     Object.keys(byMode).map((m) => m === 'needs a person' ? C.scarlet : (MODE_COLORS[m] || C.dim))));
+
+  // Hour-of-day profile: guest messages of the last 14 days as bars, QR scans
+  // of the whole campaign as a line, peak scan hour highlighted.
+  const hours = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'));
+  const hVal = (rows, h) => Number((rows.find((r) => r.hour === h) || {}).n || 0);
+  const hScans = hours.map((h) => hVal(D.hourlyScans, h));
+  const hMsgs  = hours.map((h) => hVal(D.hourlyMsgs, h));
+  const maxScan = Math.max(...hScans);
+  mk('chHours', { data: { labels: hours.map((h) => h + ':00'), datasets: [
+      { type: 'bar', label: 'guest messages', data: hMsgs, backgroundColor: 'rgba(115,51,255,.45)', borderRadius: 4, yAxisID: 'y' },
+      { type: 'line', label: 'QR scans', data: hScans, borderColor: C.scarlet, backgroundColor: C.scarlet,
+        tension: .35, pointRadius: hScans.map((v) => v === maxScan && v > 0 ? 6 : 3),
+        pointBackgroundColor: hScans.map((v) => v === maxScan && v > 0 ? C.purple : C.scarlet), yAxisID: 'y2' }]},
+    options: { ...base, scales: {
+      x: { grid: { display: false }, ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 12 } },
+      y: { ticks: { precision: 0 }, title: { display: true, text: 'messages' } },
+      y2: { position: 'right', grid: { drawOnChartArea: false }, ticks: { precision: 0 }, title: { display: true, text: 'scans' } } } } });
+
+  // Country of each guest from the number's dialling prefix.
+  const PREFIX = { '230':'Mauritius','971':'UAE','966':'Saudi Arabia','974':'Qatar','965':'Kuwait','973':'Bahrain',
+    '968':'Oman','91':'India','92':'Pakistan','44':'UK','33':'France','49':'Germany','39':'Italy','34':'Spain',
+    '41':'Switzerland','32':'Belgium','31':'Netherlands','27':'South Africa','262':'Réunion','261':'Madagascar',
+    '248':'Seychelles','254':'Kenya','20':'Egypt','90':'Türkiye','86':'China','7':'Russia','1':'USA / Canada',
+    '40':'Romania','356':'Malta','94':'Sri Lanka','60':'Malaysia','65':'Singapore','61':'Australia','963':'Syria','961':'Lebanon','962':'Jordan' };
+  const byCountry = {};
+  for (const c of D.contacts) {
+    const id = String(c.wa_id);
+    const name = PREFIX[id.slice(0, 3)] || PREFIX[id.slice(0, 2)] || PREFIX[id.slice(0, 1)] || 'Other';
+    byCountry[name] = (byCountry[name] || 0) + 1;
+  }
+  const top = Object.entries(byCountry).sort((a, b) => b[1] - a[1]);
+  const shown = top.slice(0, 6);
+  const rest = top.slice(6).reduce((s, [, n]) => s + n, 0);
+  if (rest) shown.push(['Other countries', rest]);
+  mk('chCountry', donut(shown.map(([k]) => k), shown.map(([, n]) => n),
+    [C.purple, C.scarlet, C.indigo, C.green, C.yellow, '#B8860B', C.dim]));
 }
 
 function filtered() {
@@ -460,8 +625,8 @@ function renderRows() {
     <tr class="click" data-wa="\${esc(c.wa_id)}">
       <td>\${esc(c.profile_name || c.wa_id)}</td>
       <td class="num">\${esc(c.wa_id)}</td>
-      <td>\${c.email ? esc(c.email) + (c.email_at ? ' <span class="mail-ok">✓ sent</span>' : '') : '<span class="dim">–</span>'}</td>
-      <td>\${c.source ? pill(c.source, '#14432A') : '<span class="dim">–</span>'}</td>
+      <td>\${c.email ? esc(c.email) + (c.email_at ? ' <span class="mail-ok">✓ sent</span>' : '') : '<span class="dim">·</span>'}</td>
+      <td>\${c.source ? pill(c.source, '#14432A') : '<span class="dim">·</span>'}</td>
       <td>\${modePill(c)}</td>
       <td class="num">\${when(c.last_seen_at)}</td>
       <td><button class="btn ghost" data-mail="\${esc(c.wa_id)}" \${D.emailEnabled ? '' : 'disabled'}>📧</button></td>
@@ -474,8 +639,8 @@ function renderWaiting() {
   document.getElementById('waiting').innerHTML = w.length ? \`<table>
     <thead><tr><th>Guest</th><th>Number</th><th>Source</th><th>Since</th></tr></thead><tbody>\${
     w.map((c) => \`<tr><td>\${esc(c.profile_name || c.wa_id)}</td><td class="num">\${esc(c.wa_id)}</td>
-      <td>\${c.source ? pill(c.source, '#14432A') : '<span class="dim">–</span>'}</td><td class="num">\${when(c.last_seen_at)}</td></tr>\`).join('')
-    }</tbody></table>\` : '<div class="empty">Nobody waiting — the bot has it covered. 🌿</div>';
+      <td>\${c.source ? pill(c.source, '#14432A') : '<span class="dim">·</span>'}</td><td class="num">\${when(c.last_seen_at)}</td></tr>\`).join('')
+    }</tbody></table>\` : '<div class="empty">Nobody waiting. The bot has it covered 🌿</div>';
 }
 
 function renderLeads() {
@@ -557,9 +722,13 @@ document.getElementById('emailAll').addEventListener('click', async () => {
   try {
     const r = await fetch(api('/dashboard/email-all'), { method: 'POST' });
     const j = await r.json().catch(() => ({}));
-    if (r.ok) toast('Sent ' + j.sent + ' of ' + j.candidates + (j.failed?.length ? ' — failed: ' + j.failed.join(', ') : ' 🌿'), Boolean(j.failed?.length));
+    if (r.ok) toast('Sent ' + j.sent + ' of ' + j.candidates + (j.failed?.length ? ' · failed: ' + j.failed.join(', ') : ' 🌿'), Boolean(j.failed?.length));
     else toast(j.error || 'Bulk send failed', true);
   } finally { btn.disabled = false; load(); }
+});
+
+document.getElementById('xlsx').addEventListener('click', () => {
+  location.href = api('/dashboard/report.xlsx');
 });
 
 document.getElementById('csv').addEventListener('click', () => {
