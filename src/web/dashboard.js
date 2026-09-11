@@ -29,16 +29,22 @@ const authed = (req) => config.dashboardKey && req.query.key === config.dashboar
 // Chart.js is served from the app itself: the park's office network blocks
 // some CDNs (proven on 3 Sept — tables rendered, charts never did), and the
 // dashboard must not depend on a third party being reachable.
-const CHART_JS = fs.readFileSync(path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  '..', '..', 'node_modules', 'chart.js', 'dist', 'chart.umd.js'
-));
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const CHART_JS = fs.readFileSync(path.join(ROOT, 'node_modules', 'chart.js', 'dist', 'chart.umd.js'));
+// The park's official favicon (vallepark.com), self-served like everything else.
+const FAVICON = fs.readFileSync(path.join(ROOT, 'assets', 'marketing', 'valle-favicon.png'));
 
 export function mountDashboard(app) {
   app.get('/dashboard/chart.js', (_req, res) => {
     res.set('Content-Type', 'application/javascript');
     res.set('Cache-Control', 'public, max-age=86400');
     res.send(CHART_JS);
+  });
+
+  app.get('/dashboard/favicon.png', (_req, res) => {
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'public, max-age=604800');
+    res.send(FAVICON);
   });
 
   app.get('/dashboard', (req, res) => {
@@ -51,7 +57,8 @@ export function mountDashboard(app) {
   app.get('/dashboard/data', async (req, res) => {
     if (!authed(req)) return res.sendStatus(403);
     try {
-      const [stats, series, scans, hourlyScans, hourlyMsgs, waiting, leads, contacts, messages] = await Promise.all([
+      const [stats, series, scans, hourlyScans, hourlyMsgs, scanEvents, outAuthors, msgTypes, avgReply,
+             waiting, leads, contacts, messages] = await Promise.all([
         q(`SELECT
              (SELECT count(*) FROM contacts)                                                        AS total_contacts,
              (SELECT count(*) FROM contacts WHERE source IS NOT NULL)                               AS qr_scans,
@@ -73,6 +80,21 @@ export function mountDashboard(app) {
         q(`SELECT to_char(created_at AT TIME ZONE $1, 'HH24') AS hour, count(*) AS n
              FROM messages WHERE direction = 'in' AND created_at > now() - interval '14 days'
             GROUP BY 1 ORDER BY 1`, [TZ]),
+        q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day,
+                  to_char(created_at AT TIME ZONE $1, 'HH24:MI') AS tod,
+                  EXTRACT(HOUR FROM created_at AT TIME ZONE $1)
+                  + EXTRACT(MINUTE FROM created_at AT TIME ZONE $1) / 60.0 AS y
+             FROM contacts WHERE source IS NOT NULL ORDER BY created_at ASC LIMIT 2000`, [TZ]),
+        q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day, author, count(*) AS n
+             FROM messages WHERE direction = 'out' AND created_at > now() - interval '14 days'
+            GROUP BY 1, 2 ORDER BY 1`, [TZ]),
+        q(`SELECT COALESCE(msg_type, 'text') AS type, count(*) AS n
+             FROM messages WHERE direction = 'in' GROUP BY 1 ORDER BY 2 DESC`),
+        q(`SELECT round(avg(gap))::int AS s FROM (
+              SELECT EXTRACT(EPOCH FROM (created_at - lag(created_at) OVER w)) AS gap,
+                     author, lag(direction) OVER w AS prev_dir
+                FROM messages WINDOW w AS (PARTITION BY contact_id ORDER BY created_at, id)
+            ) x WHERE author = 'bot' AND prev_dir = 'in' AND gap BETWEEN 0 AND 300`),
         q(`SELECT wa_id, profile_name, source, last_seen_at FROM contacts
             WHERE mode = 'waiting' ORDER BY last_seen_at ASC LIMIT 50`),
         q(`SELECT l.created_at, l.full_name, l.pax, l.visit_date, l.interest, c.profile_name, c.wa_id
@@ -93,6 +115,10 @@ export function mountDashboard(app) {
         scans: scans.rows,
         hourlyScans: hourlyScans.rows,
         hourlyMsgs: hourlyMsgs.rows,
+        scanEvents: scanEvents.rows,
+        outAuthors: outAuthors.rows,
+        msgTypes: msgTypes.rows,
+        avgReply: avgReply.rows[0]?.s ?? null,
         waiting: waiting.rows,
         leads: leads.rows,
         contacts: contacts.rows,
@@ -283,6 +309,7 @@ const GATE = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vallé Concierge Access</title>
+<link rel="icon" type="image/png" href="/dashboard/favicon.png">
 <link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@1,800&family=Work+Sans:wght@400;600&display=swap" rel="stylesheet">
 <style>
   body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
@@ -312,6 +339,7 @@ const PAGE = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vallé Concierge Dashboard</title>
+<link rel="icon" type="image/png" href="/dashboard/favicon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Barlow:ital,wght@1,800&family=Work+Sans:wght@400;500;600&family=Chivo+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="/dashboard/chart.js"></script>
@@ -431,7 +459,10 @@ const PAGE = `<!doctype html>
     <div class="panel"><h3>QR scans per day · last 14 days</h3><div class="cv"><canvas id="chScans"></canvas></div></div>
     <div class="panel"><h3>Chats by mode</h3><div class="cv"><canvas id="chMode"></canvas></div></div>
     <div class="panel"><h3>Activity by hour of day · scans and guest messages</h3><div class="cv"><canvas id="chHours"></canvas></div></div>
-    <div class="panel"><h3>Guests by country</h3><div class="cv"><canvas id="chCountry"></canvas></div></div>
+    <div class="panel"><h3>Guests by country</h3><div class="cv" style="height:240px"><canvas id="chCountry"></canvas></div></div>
+    <div class="panel"><h3>Every QR scan · exact date and time</h3><div class="cv"><canvas id="chScanTimes"></canvas></div></div>
+    <div class="panel"><h3>Guest messages by type</h3><div class="cv"><canvas id="chTypes"></canvas></div></div>
+    <div class="panel" style="grid-column:1/-1"><h3>Conversation load · guests, AI and team per day</h3><div class="cv"><canvas id="chAiTeam"></canvas></div></div>
   </div>
 
   <h2>Guests</h2>
@@ -463,7 +494,7 @@ const PAGE = `<!doctype html>
 </div>
 
 <div class="overlay" id="overlay"><div class="modal">
-  <header><h4 id="mName"></h4><div class="meta" id="mMeta"></div><button class="x" id="mClose">✕</button></header>
+  <header><h4 id="mName"></h4><div class="meta" id="mMeta"></div><button class="x" id="mClose">&times;</button></header>
   <div class="chat" id="mChat"></div>
   <footer>
     <input id="mEmail" type="email" placeholder="guest email…">
@@ -518,7 +549,8 @@ function tiles() {
     t(s.total_contacts,'Guests') + t(s.qr_scans,'QR scans','go') + t(s.active_24h,'Active 24 h') +
     t(s.waiting,'Waiting', s.waiting > 0 ? 'warn' : '') + t(s.msgs_24h,'Messages 24 h') +
     t(s.leads_total,'Leads') + t(s.emails_captured,'Emails captured') + t(s.emails_sent,'Overviews sent','go') +
-    t(peak ? peak + ':00' : '·','Peak scan hour','go') + t(busyLabel,'Busiest day');
+    t(peak ? peak + ':00' : '·','Peak scan hour','go') + t(busyLabel,'Busiest day') +
+    t(D.avgReply != null ? D.avgReply + ' s' : '·','Avg AI reply time','go');
 }
 
 function drawCharts() {
@@ -574,24 +606,76 @@ function drawCharts() {
       y: { ticks: { precision: 0 }, title: { display: true, text: 'messages' } },
       y2: { position: 'right', grid: { drawOnChartArea: false }, ticks: { precision: 0 }, title: { display: true, text: 'scans' } } } } });
 
-  // Country of each guest from the number's dialling prefix.
+  // Country of each guest from the number's dialling prefix. Every prefix we
+  // have ever seen is named; only a truly unknown code shows as Unrecognised.
   const PREFIX = { '230':'Mauritius','971':'UAE','966':'Saudi Arabia','974':'Qatar','965':'Kuwait','973':'Bahrain',
-    '968':'Oman','91':'India','92':'Pakistan','44':'UK','33':'France','49':'Germany','39':'Italy','34':'Spain',
-    '41':'Switzerland','32':'Belgium','31':'Netherlands','27':'South Africa','262':'Réunion','261':'Madagascar',
-    '248':'Seychelles','254':'Kenya','20':'Egypt','90':'Türkiye','86':'China','7':'Russia','1':'USA / Canada',
-    '40':'Romania','356':'Malta','94':'Sri Lanka','60':'Malaysia','65':'Singapore','61':'Australia','963':'Syria','961':'Lebanon','962':'Jordan' };
+    '968':'Oman','91':'India','92':'Pakistan','880':'Bangladesh','94':'Sri Lanka','977':'Nepal',
+    '44':'United Kingdom','33':'France','49':'Germany','39':'Italy','34':'Spain','351':'Portugal',
+    '41':'Switzerland','43':'Austria','32':'Belgium','31':'Netherlands','352':'Luxembourg','353':'Ireland',
+    '45':'Denmark','46':'Sweden','47':'Norway','358':'Finland','48':'Poland','420':'Czechia','36':'Hungary',
+    '30':'Greece','40':'Romania','359':'Bulgaria','385':'Croatia','381':'Serbia','386':'Slovenia',
+    '356':'Malta','357':'Cyprus','7':'Russia','380':'Ukraine','90':'Türkiye','972':'Israel',
+    '961':'Lebanon','962':'Jordan','963':'Syria','964':'Iraq','98':'Iran','93':'Afghanistan',
+    '20':'Egypt','212':'Morocco','213':'Algeria','216':'Tunisia','218':'Libya','249':'Sudan',
+    '251':'Ethiopia','254':'Kenya','255':'Tanzania','256':'Uganda','250':'Rwanda','257':'Burundi',
+    '260':'Zambia','263':'Zimbabwe','258':'Mozambique','265':'Malawi','267':'Botswana','264':'Namibia',
+    '27':'South Africa','262':'Réunion','261':'Madagascar','248':'Seychelles','269':'Comoros','290':'St Helena',
+    '234':'Nigeria','233':'Ghana','225':'Ivory Coast','221':'Senegal','237':'Cameroon',
+    '86':'China','852':'Hong Kong','853':'Macau','886':'Taiwan','81':'Japan','82':'South Korea',
+    '84':'Vietnam','66':'Thailand','60':'Malaysia','65':'Singapore','62':'Indonesia','63':'Philippines',
+    '855':'Cambodia','856':'Laos','95':'Myanmar','673':'Brunei','960':'Maldives',
+    '61':'Australia','64':'New Zealand','679':'Fiji',
+    '1':'USA / Canada','52':'Mexico','55':'Brazil','54':'Argentina','56':'Chile','57':'Colombia','51':'Peru',
+    '598':'Uruguay','593':'Ecuador','591':'Bolivia','58':'Venezuela','506':'Costa Rica','507':'Panama',
+    '509':'Haiti','53':'Cuba','976':'Mongolia','996':'Kyrgyzstan','998':'Uzbekistan','7 7':'Kazakhstan',
+    '994':'Azerbaijan','995':'Georgia','374':'Armenia' };
   const byCountry = {};
   for (const c of D.contacts) {
     const id = String(c.wa_id);
-    const name = PREFIX[id.slice(0, 3)] || PREFIX[id.slice(0, 2)] || PREFIX[id.slice(0, 1)] || 'Other';
+    const name = PREFIX[id.slice(0, 3)] || PREFIX[id.slice(0, 2)] || PREFIX[id.slice(0, 1)] || 'Unrecognised';
     byCountry[name] = (byCountry[name] || 0) + 1;
   }
-  const top = Object.entries(byCountry).sort((a, b) => b[1] - a[1]);
-  const shown = top.slice(0, 6);
-  const rest = top.slice(6).reduce((s, [, n]) => s + n, 0);
-  if (rest) shown.push(['Other countries', rest]);
-  mk('chCountry', donut(shown.map(([k]) => k), shown.map(([, n]) => n),
-    [C.purple, C.scarlet, C.indigo, C.green, C.yellow, '#B8860B', C.dim]));
+  const top = Object.entries(byCountry).sort((a, b) => b[1] - a[1]).slice(0, 12);
+  const PALETTE = [C.purple, C.scarlet, C.indigo, '#0F7A3D', '#B8860B', '#0B7285',
+                   '#A61E4D', '#5C40B5', '#2B6CB0', '#846358', '#556B2F', C.dim];
+  mk('chCountry', { type: 'bar', data: { labels: top.map(([k]) => k),
+      datasets: [{ data: top.map(([, n]) => n), backgroundColor: top.map((_, i) => PALETTE[i % PALETTE.length]), borderRadius: 4 }]},
+    options: { ...base, indexAxis: 'y', plugins: { legend: { display: false } },
+      scales: { x: { ticks: { precision: 0 } }, y: { grid: { display: false } } } } });
+
+  // Every individual QR scan as a point: the day along the bottom, the exact
+  // time of day on the left. The campaign story at a glance.
+  const scanDays = [...new Set(D.scanEvents.map((e) => e.day))].sort();
+  const dayIdx = new Map(scanDays.map((d, i) => [d, i]));
+  mk('chScanTimes', { type: 'scatter', data: { datasets: [{
+      label: 'QR scan', data: D.scanEvents.map((e) => ({ x: dayIdx.get(e.day), y: Number(e.y), tod: e.tod, day: e.day })),
+      backgroundColor: C.scarlet, borderColor: C.purple, borderWidth: 1.5, pointRadius: 5, pointHoverRadius: 7 }]},
+    options: { ...base, plugins: { legend: { display: false }, tooltip: { callbacks: {
+        label: (i) => i.raw.day + ' at ' + i.raw.tod } } },
+      scales: {
+        x: { min: -0.5, max: Math.max(scanDays.length - 0.5, 0.5), ticks: { stepSize: 1,
+             callback: (v) => scanDays[Math.round(v)] ? scanDays[Math.round(v)].slice(5) : '' }, grid: { display: false } },
+        y: { min: 6, max: 22, ticks: { stepSize: 2, callback: (v) => String(v).padStart(2, '0') + ':00' },
+             title: { display: true, text: 'time of day' } } } } });
+
+  // Who is carrying the conversations: guest messages against AI and team
+  // replies, day by day.
+  const outBy = (author) => days.map((d) => Number((D.outAuthors.find((r) => r.day === d && r.author === author) || {}).n || 0));
+  mk('chAiTeam', { data: { labels: short, datasets: [
+      { type: 'bar', label: 'AI replies', data: outBy('bot'), backgroundColor: C.indigo, stack: 'r', borderRadius: 5 },
+      { type: 'bar', label: 'team replies', data: outBy('agent'), backgroundColor: C.scarlet, stack: 'r', borderRadius: 5 },
+      { type: 'line', label: 'guest messages', data: series('in'), borderColor: C.purple, backgroundColor: C.purple,
+        tension: .35, pointRadius: 3 }]},
+    options: { ...base, scales: { x: { stacked: true, grid: { display: false } }, y: { stacked: true, ticks: { precision: 0 } } } } });
+
+  // What guests send: text, voice notes, photos and the rest.
+  const TYPE_LABELS = { text: 'Text', audio: 'Voice notes', image: 'Photos', video: 'Videos',
+    document: 'Documents', location: 'Locations', sticker: 'Stickers', contacts: 'Contact cards',
+    interactive: 'Menu taps', button: 'Button taps', reaction: 'Reactions',
+    edit: 'Edited messages', revoke: 'Deleted messages', unsupported: 'Other' };
+  const types = D.msgTypes.map((r) => [TYPE_LABELS[r.type] || r.type, Number(r.n)]);
+  mk('chTypes', donut(types.map(([k]) => k), types.map(([, n]) => n),
+    [C.purple, C.scarlet, C.indigo, '#0F7A3D', '#B8860B', C.green, C.yellow, C.dim]));
 }
 
 function filtered() {
@@ -624,7 +708,7 @@ function renderRows() {
     <tr class="click" data-wa="\${esc(c.wa_id)}">
       <td>\${esc(c.profile_name || c.wa_id)}</td>
       <td class="num">\${esc(c.wa_id)}</td>
-      <td>\${c.email ? esc(c.email) + (c.email_at ? ' <span class="mail-ok">✓ sent</span>' : '') : '<span class="dim">·</span>'}</td>
+      <td>\${c.email ? esc(c.email) + (c.email_at ? ' <span class="mail-ok">Sent</span>' : '') : '<span class="dim">·</span>'}</td>
       <td>\${c.source ? pill(c.source, '#14432A') : '<span class="dim">·</span>'}</td>
       <td>\${modePill(c)}</td>
       <td class="num">\${when(c.last_seen_at)}</td>
