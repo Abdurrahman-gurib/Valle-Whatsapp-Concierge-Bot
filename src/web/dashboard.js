@@ -344,11 +344,9 @@ const PAGE = `<!doctype html>
 
   /* KPI tiles */
   .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:12px;margin-top:-14px;position:relative}
-  .tile{background:var(--card);border:1px solid #EFEAE0;border-radius:16px;padding:13px 15px;border-bottom:4px solid var(--indigo);
-        box-shadow:0 1px 2px rgba(34,19,58,.04),0 10px 28px -18px rgba(34,19,58,.25);
-        transition:transform .15s,box-shadow .15s}
-  .tile:hover{transform:translateY(-2px);box-shadow:0 2px 4px rgba(34,19,58,.05),0 16px 34px -18px rgba(34,19,58,.3)}
-  .tile .n{font:600 25px 'Chivo Mono',monospace;color:var(--purple)}
+  .tile{background:var(--card);border:1px solid #EFEAE0;border-radius:14px;padding:14px 16px;border-bottom:3px solid var(--indigo);
+        box-shadow:0 1px 2px rgba(34,19,58,.04),0 10px 28px -20px rgba(34,19,58,.22)}
+  .tile .n{font:600 24px 'Chivo Mono',monospace;color:var(--purple)}
   .tile .l{font-size:11px;color:var(--dim);letter-spacing:.07em;text-transform:uppercase;font-weight:600}
   .tile.warn{border-bottom-color:var(--scarlet)} .tile.warn .n{color:var(--scarlet)}
   .tile.go{border-bottom-color:var(--green)}
@@ -373,6 +371,7 @@ const PAGE = `<!doctype html>
   .btn.go{background:#0F7A3D;color:#fff}
   .btn.ghost{background:var(--lavender);color:var(--purple)}
   .btn:disabled{opacity:.5;cursor:default}
+  .btn.sm{padding:5px 11px;font-size:12px}
   .count{font-size:12px;color:var(--dim);margin-left:auto}
 
   /* tables */
@@ -442,10 +441,10 @@ const PAGE = `<!doctype html>
     <select id="fMode"><option value="">Mode: all</option><option value="bot">bot</option><option value="human">human</option><option value="waiting">waiting</option><option value="paused">paused</option><option value="__needs">needs a person</option></select>
     <select id="fEmail"><option value="">Email: all</option><option value="has">captured</option><option value="sent">overview sent</option><option value="unsent">captured, not sent</option><option value="none">none</option></select>
     <select id="fWhen"><option value="">Seen: any time</option><option value="1">today</option><option value="7">last 7 days</option></select>
-    <button class="btn go" id="xlsx" title="Excel workbook: every QR guest with number and scan time, the daily timeline, and the hourly profile with the peak">📊 Excel report</button>
-    <button class="btn ghost" id="csv">⬇ CSV</button>
-    <button class="btn ghost" onclick="window.print()">🖨 Print</button>
-    <button class="btn hot" id="emailAll" title="Overview email to every QR guest with a captured address who has not received it">📧 Email all ATM scans</button>
+    <button class="btn go" id="xlsx" title="Excel workbook: every QR guest with number and scan time, the daily timeline, and the hourly profile with the peak">Excel report</button>
+    <button class="btn ghost" id="csv">CSV</button>
+    <button class="btn ghost" onclick="window.print()">Print</button>
+    <button class="btn hot" id="emailAll" title="Overview email to every QR guest with a captured address who has not received it">Email all ATM scans</button>
     <span class="count" id="count"></span>
   </div>
   <div class="card"><table>
@@ -453,7 +452,7 @@ const PAGE = `<!doctype html>
     <tbody id="rows"></tbody>
   </table></div>
 
-  <h2>Waiting for a human 🔔</h2>
+  <h2>Waiting for a human</h2>
   <div class="card" id="waiting"></div>
 
   <h2>Leads</h2>
@@ -468,7 +467,7 @@ const PAGE = `<!doctype html>
   <div class="chat" id="mChat"></div>
   <footer>
     <input id="mEmail" type="email" placeholder="guest email…">
-    <button class="btn primary" id="mSend">📧 Send overview</button>
+    <button class="btn primary" id="mSend">Send overview</button>
   </footer>
 </div></div>
 
@@ -517,7 +516,7 @@ function tiles() {
   const t = (n, l, cls='') => \`<div class="tile \${cls}"><div class="n num">\${n}</div><div class="l">\${l}</div></div>\`;
   document.getElementById('tiles').innerHTML =
     t(s.total_contacts,'Guests') + t(s.qr_scans,'QR scans','go') + t(s.active_24h,'Active 24 h') +
-    t(s.waiting,'Waiting 🔔', s.waiting > 0 ? 'warn' : '') + t(s.msgs_24h,'Messages 24 h') +
+    t(s.waiting,'Waiting', s.waiting > 0 ? 'warn' : '') + t(s.msgs_24h,'Messages 24 h') +
     t(s.leads_total,'Leads') + t(s.emails_captured,'Emails captured') + t(s.emails_sent,'Overviews sent','go') +
     t(peak ? peak + ':00' : '·','Peak scan hour','go') + t(busyLabel,'Busiest day');
 }
@@ -629,7 +628,7 @@ function renderRows() {
       <td>\${c.source ? pill(c.source, '#14432A') : '<span class="dim">·</span>'}</td>
       <td>\${modePill(c)}</td>
       <td class="num">\${when(c.last_seen_at)}</td>
-      <td><button class="btn ghost" data-mail="\${esc(c.wa_id)}" \${D.emailEnabled ? '' : 'disabled'}>📧</button></td>
+      <td><button class="btn ghost sm" data-mail="\${esc(c.wa_id)}" \${D.emailEnabled ? '' : 'disabled'}>Email</button></td>
     </tr>\`).join('')
     : '<tr><td colspan="7" class="empty">No guests match these filters.</td></tr>';
 }
@@ -640,7 +639,7 @@ function renderWaiting() {
     <thead><tr><th>Guest</th><th>Number</th><th>Source</th><th>Since</th></tr></thead><tbody>\${
     w.map((c) => \`<tr><td>\${esc(c.profile_name || c.wa_id)}</td><td class="num">\${esc(c.wa_id)}</td>
       <td>\${c.source ? pill(c.source, '#14432A') : '<span class="dim">·</span>'}</td><td class="num">\${when(c.last_seen_at)}</td></tr>\`).join('')
-    }</tbody></table>\` : '<div class="empty">Nobody waiting. The bot has it covered 🌿</div>';
+    }</tbody></table>\` : '<div class="empty">Nobody waiting. The bot has every conversation covered.</div>';
 }
 
 function renderLeads() {
@@ -657,7 +656,7 @@ function renderFeed() {
   document.getElementById('feed').innerHTML = m.length ? \`<table>
     <thead><tr><th>When</th><th>Guest</th><th></th><th>From</th><th>Message</th></tr></thead><tbody>\${
     m.map((x) => \`<tr><td class="num">\${when(x.created_at)}</td><td>\${esc(x.profile_name || x.wa_id)}</td>
-      <td style="color:\${x.direction === 'in' ? C.indigo : '#1E8A4C'};font-weight:600">\${x.direction === 'in' ? '⟶' : '⟵'}</td>
+      <td style="color:\${x.direction === 'in' ? C.indigo : '#1E8A4C'};font-weight:600;font-size:11px;letter-spacing:.06em">\${x.direction === 'in' ? 'IN' : 'OUT'}</td>
       <td>\${esc(x.author)}</td><td class="msg">\${esc(x.body || '')}</td></tr>\`).join('')
     }</tbody></table>\` : '<div class="empty">No messages yet.</div>';
 }
@@ -687,7 +686,7 @@ async function sendOverview(waId, typedEmail) {
   const r = await fetch(api('/dashboard/email'), { method: 'POST',
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const j = await r.json().catch(() => ({}));
-  if (r.ok) { toast('Overview emailed to ' + j.email + ' 🌿'); load(); }
+  if (r.ok) { toast('Overview emailed to ' + j.email); load(); }
   else toast(j.error || 'Send failed', true);
 }
 
@@ -716,13 +715,13 @@ document.getElementById('mSend').addEventListener('click', () => {
 
 document.getElementById('emailAll').addEventListener('click', async () => {
   const pending = D.contacts.filter((c) => c.source && c.email && !c.email_at).length;
-  if (!pending) { toast('Every QR guest with an email already has the overview 🌿'); return; }
+  if (!pending) { toast('Every QR guest with an email already has the overview.'); return; }
   if (!confirm('Send the park overview to ' + pending + ' QR guest(s) with a captured email who have not received it yet?')) return;
   const btn = document.getElementById('emailAll'); btn.disabled = true;
   try {
     const r = await fetch(api('/dashboard/email-all'), { method: 'POST' });
     const j = await r.json().catch(() => ({}));
-    if (r.ok) toast('Sent ' + j.sent + ' of ' + j.candidates + (j.failed?.length ? ' · failed: ' + j.failed.join(', ') : ' 🌿'), Boolean(j.failed?.length));
+    if (r.ok) toast('Sent ' + j.sent + ' of ' + j.candidates + (j.failed?.length ? ' · failed: ' + j.failed.join(', ') : ''), Boolean(j.failed?.length));
     else toast(j.error || 'Bulk send failed', true);
   } finally { btn.disabled = false; load(); }
 });
