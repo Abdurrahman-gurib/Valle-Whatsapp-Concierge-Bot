@@ -34,6 +34,38 @@ const CHART_JS = fs.readFileSync(path.join(ROOT, 'node_modules', 'chart.js', 'di
 // The park's official favicon (vallepark.com), self-served like everything else.
 const FAVICON = fs.readFileSync(path.join(ROOT, 'assets', 'marketing', 'valle-favicon.png'));
 
+/* Country from the number's dialling prefix — the one map both the page and
+   the Excel report use, so they can never disagree. */
+const COUNTRY_PREFIX = { '230':'Mauritius','971':'UAE','966':'Saudi Arabia','974':'Qatar','965':'Kuwait','973':'Bahrain',
+  '968':'Oman','91':'India','92':'Pakistan','880':'Bangladesh','94':'Sri Lanka','977':'Nepal',
+  '44':'United Kingdom','33':'France','49':'Germany','39':'Italy','34':'Spain','351':'Portugal',
+  '41':'Switzerland','43':'Austria','32':'Belgium','31':'Netherlands','352':'Luxembourg','353':'Ireland',
+  '45':'Denmark','46':'Sweden','47':'Norway','358':'Finland','48':'Poland','420':'Czechia','36':'Hungary',
+  '30':'Greece','40':'Romania','359':'Bulgaria','385':'Croatia','381':'Serbia','386':'Slovenia',
+  '356':'Malta','357':'Cyprus','7':'Russia','380':'Ukraine','90':'Türkiye','972':'Israel',
+  '961':'Lebanon','962':'Jordan','963':'Syria','964':'Iraq','98':'Iran','93':'Afghanistan',
+  '20':'Egypt','212':'Morocco','213':'Algeria','216':'Tunisia','218':'Libya','249':'Sudan',
+  '251':'Ethiopia','254':'Kenya','255':'Tanzania','256':'Uganda','250':'Rwanda','257':'Burundi',
+  '260':'Zambia','263':'Zimbabwe','258':'Mozambique','265':'Malawi','267':'Botswana','264':'Namibia',
+  '27':'South Africa','262':'Réunion','261':'Madagascar','248':'Seychelles','269':'Comoros','290':'St Helena',
+  '234':'Nigeria','233':'Ghana','225':'Ivory Coast','221':'Senegal','237':'Cameroon',
+  '86':'China','852':'Hong Kong','853':'Macau','886':'Taiwan','81':'Japan','82':'South Korea',
+  '84':'Vietnam','66':'Thailand','60':'Malaysia','65':'Singapore','62':'Indonesia','63':'Philippines',
+  '855':'Cambodia','856':'Laos','95':'Myanmar','673':'Brunei','960':'Maldives',
+  '61':'Australia','64':'New Zealand','679':'Fiji',
+  '1':'USA / Canada','52':'Mexico','55':'Brazil','54':'Argentina','56':'Chile','57':'Colombia','51':'Peru',
+  '598':'Uruguay','593':'Ecuador','591':'Bolivia','58':'Venezuela','506':'Costa Rica','507':'Panama',
+  '509':'Haiti','53':'Cuba','976':'Mongolia','996':'Kyrgyzstan','998':'Uzbekistan',
+  '994':'Azerbaijan','995':'Georgia','374':'Armenia' };
+const countryOf = (waId) => {
+  const id = String(waId || '');
+  return COUNTRY_PREFIX[id.slice(0, 3)] || COUNTRY_PREFIX[id.slice(0, 2)]
+      || COUNTRY_PREFIX[id.slice(0, 1)] || 'Unrecognised';
+};
+
+/** A YYYY-MM-DD string or null; anything else is rejected, never interpolated. */
+const dayParam = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? v : null);
+
 export function mountDashboard(app) {
   app.get('/dashboard/chart.js', (_req, res) => {
     res.set('Content-Type', 'application/javascript');
@@ -139,11 +171,11 @@ export function mountDashboard(app) {
         msgTypes: msgTypes.rows,
         avgReply: avgReply.rows[0]?.s ?? null,
         perAgent: perAgent.rows,
-        unanswered: unanswered.rows,
+        unanswered: unanswered.rows.map((c) => ({ ...c, country: countryOf(c.wa_id) })),
         deleted: deleted.rows[0],
         waiting: waiting.rows,
         leads: leads.rows,
-        contacts: contacts.rows,
+        contacts: contacts.rows.map((c) => ({ ...c, country: countryOf(c.wa_id) })),
         messages: messages.rows,
       });
     } catch (err) {
@@ -152,31 +184,39 @@ export function mountDashboard(app) {
     }
   });
 
-  // Excel report: every QR guest with number and exact scan time, the daily
-  // timeline, and the hour-of-day profile with the peak marked.
+  // Excel report. Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD (Mauritius days,
+  // inclusive) restrict EVERY sheet to that range, so the "today" report
+  // holds exactly today's records and nothing else.
   app.get('/dashboard/report.xlsx', async (req, res) => {
     if (!authed(req)) return res.sendStatus(403);
     try {
-      const [guests, daily, hourly] = await Promise.all([
-        q(`SELECT profile_name, wa_id, email, email_at, source, mode,
-                  created_at, last_seen_at
-             FROM contacts WHERE source IS NOT NULL ORDER BY created_at ASC`),
-        q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day,
-                  count(*) FILTER (WHERE source IS NOT NULL) AS scans
-             FROM contacts GROUP BY 1 ORDER BY 1`, [TZ]),
-        q(`SELECT to_char(created_at AT TIME ZONE $1, 'HH24') AS hour, count(*) AS n
-             FROM contacts WHERE source IS NOT NULL GROUP BY 1 ORDER BY 1`, [TZ]),
-      ]);
-      const msgDaily = await q(
-        `SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day,
-                count(*) FILTER (WHERE direction = 'in')  AS from_guests,
-                count(*) FILTER (WHERE direction = 'out') AS replies
-           FROM messages GROUP BY 1 ORDER BY 1`, [TZ]);
+      const from = dayParam(req.query.from);
+      const to = dayParam(req.query.to);
+      // $1 = timezone, $2 = from, $3 = to; null bounds are open.
+      const RANGE = `($2::date IS NULL OR (created_at AT TIME ZONE $1)::date >= $2::date)
+                 AND ($3::date IS NULL OR (created_at AT TIME ZONE $1)::date <= $3::date)`;
+      const P = [TZ, from, to];
 
-      const local = (d) => new Intl.DateTimeFormat('en-GB', {
-        timeZone: TZ, day: '2-digit', month: 'short', year: 'numeric',
-        hour: '2-digit', minute: '2-digit',
-      }).format(new Date(d));
+      const [guests, daily, hourly, msgDaily] = await Promise.all([
+        q(`SELECT profile_name, wa_id, email, email_at, source, mode, last_seen_at,
+                  to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS scan_date,
+                  to_char(created_at AT TIME ZONE $1, 'HH24:MI:SS') AS scan_time
+             FROM contacts WHERE source IS NOT NULL AND ${RANGE}
+            ORDER BY created_at ASC`, P),
+        q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day, count(*) AS scans
+             FROM contacts WHERE source IS NOT NULL AND ${RANGE} GROUP BY 1 ORDER BY 1`, P),
+        q(`SELECT to_char(created_at AT TIME ZONE $1, 'HH24') AS hour, count(*) AS n
+             FROM contacts WHERE source IS NOT NULL AND ${RANGE} GROUP BY 1 ORDER BY 1`, P),
+        q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day,
+                  count(*) FILTER (WHERE direction = 'in')  AS from_guests,
+                  count(*) FILTER (WHERE direction = 'out') AS replies
+             FROM messages WHERE ${RANGE} GROUP BY 1 ORDER BY 1`, P),
+      ]);
+
+      const local = (d) => d ? new Intl.DateTimeFormat('en-GB', {
+        timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+      }).format(new Date(d)) : '';
 
       const wb = new ExcelJS.Workbook();
       wb.creator = 'Vallé WhatsApp Concierge';
@@ -188,23 +228,53 @@ export function mountDashboard(app) {
         ws.views = [{ state: 'frozen', ySplit: 1 }];
       };
 
+      // ── Summary ──
+      const byCountry = {};
+      for (const c of guests.rows) {
+        const k = countryOf(c.wa_id);
+        byCountry[k] = (byCountry[k] || 0) + 1;
+      }
+      const byHour = new Map(hourly.rows.map((r) => [r.hour, Number(r.n)]));
+      const peakN = Math.max(0, ...byHour.values());
+      const peakH = [...byHour.entries()].find(([, n]) => n === peakN)?.[0];
+      const s = wb.addWorksheet('Summary');
+      s.columns = [{ header: 'Vallé WhatsApp Concierge report', key: 'k', width: 34 },
+                   { header: '', key: 'v', width: 40 }];
+      s.addRows([
+        { k: 'Report range (Mauritius days)', v: (from || 'campaign start') + ' to ' + (to || 'today') },
+        { k: 'Generated', v: local(new Date()) + ' (Mauritius time)' },
+        { k: 'QR scans in range', v: guests.rows.length },
+        { k: 'Emails captured in range', v: guests.rows.filter((c) => c.email).length },
+        { k: 'Overviews emailed in range', v: guests.rows.filter((c) => c.email_at).length },
+        { k: 'Countries in range', v: Object.keys(byCountry).length },
+        { k: 'Peak scan hour in range', v: peakN > 0 ? `${peakH}:00 (${peakN} scans)` : 'no scans in range' },
+        { k: 'Guest messages in range', v: msgDaily.rows.reduce((x, r) => x + Number(r.from_guests), 0) },
+        { k: 'Replies in range', v: msgDaily.rows.reduce((x, r) => x + Number(r.replies), 0) },
+      ]);
+      head(s);
+
+      // ── QR guests, one row per scan with the exact moment ──
       const g = wb.addWorksheet('QR guests');
       g.columns = [
+        { header: 'Scan date', key: 'sd', width: 12 },
+        { header: 'Scan time', key: 'st', width: 11 },
         { header: 'Guest', key: 'name', width: 26 },
         { header: 'Number', key: 'num', width: 16 },
+        { header: 'Country', key: 'country', width: 16 },
         { header: 'Email', key: 'email', width: 30 },
-        { header: 'Overview emailed', key: 'sent', width: 19 },
-        { header: 'Source', key: 'src', width: 16 },
-        { header: 'Scanned (Mauritius time)', key: 'scan', width: 22 },
-        { header: 'Last seen', key: 'seen', width: 19 },
+        { header: 'Overview emailed', key: 'sent', width: 20 },
+        { header: 'Source', key: 'src', width: 15 },
+        { header: 'Mode', key: 'mode', width: 9 },
+        { header: 'Last seen', key: 'seen', width: 20 },
       ];
       for (const c of guests.rows) {
-        g.addRow({ name: c.profile_name || '', num: c.wa_id, email: c.email || '',
-          sent: c.email_at ? local(c.email_at) : '', src: c.source,
-          scan: local(c.created_at), seen: local(c.last_seen_at) });
+        g.addRow({ sd: c.scan_date, st: c.scan_time, name: c.profile_name || '',
+          num: c.wa_id, country: countryOf(c.wa_id), email: c.email || '',
+          sent: local(c.email_at), src: c.source, mode: c.mode, seen: local(c.last_seen_at) });
       }
       head(g);
 
+      // ── Daily timeline ──
       const t = wb.addWorksheet('Daily timeline');
       t.columns = [
         { header: 'Date', key: 'day', width: 14 },
@@ -214,31 +284,40 @@ export function mountDashboard(app) {
       ];
       const msgByDay = new Map(msgDaily.rows.map((r) => [r.day, r]));
       const dayRows = new Map(daily.rows.map((r) => [r.day, Number(r.scans)]));
-      for (const day of new Set([...dayRows.keys(), ...msgByDay.keys()])) {
+      for (const day of [...new Set([...dayRows.keys(), ...msgByDay.keys()])].sort()) {
         const m = msgByDay.get(day) || {};
         t.addRow({ day, scans: dayRows.get(day) || 0,
           in: Number(m.from_guests || 0), out: Number(m.replies || 0) });
       }
       head(t);
 
+      // ── Hourly profile ──
       const h = wb.addWorksheet('Hourly profile');
       h.columns = [
         { header: 'Hour (Mauritius time)', key: 'hour', width: 20 },
         { header: 'QR scans', key: 'n', width: 11 },
         { header: '', key: 'peak', width: 10 },
       ];
-      const byHour = new Map(hourly.rows.map((r) => [r.hour, Number(r.n)]));
-      const max = Math.max(0, ...byHour.values());
       for (let i = 0; i < 24; i++) {
         const hh = String(i).padStart(2, '0');
         const n = byHour.get(hh) || 0;
-        h.addRow({ hour: `${hh}:00`, n, peak: n === max && n > 0 ? 'PEAK' : '' });
+        h.addRow({ hour: `${hh}:00`, n, peak: n === peakN && n > 0 ? 'PEAK' : '' });
       }
       head(h);
 
+      // ── Countries ──
+      const cw = wb.addWorksheet('Countries');
+      cw.columns = [
+        { header: 'Country', key: 'c', width: 22 },
+        { header: 'QR scans', key: 'n', width: 11 },
+      ];
+      for (const [c, n] of Object.entries(byCountry).sort((a, b) => b[1] - a[1])) cw.addRow({ c, n });
+      head(cw);
+
+      const stamp = from && to ? (from === to ? from : `${from}_${to}`)
+        : new Date().toISOString().slice(0, 10);
       res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.set('Content-Disposition',
-        `attachment; filename="valle-qr-report-${new Date().toISOString().slice(0, 10)}.xlsx"`);
+      res.set('Content-Disposition', `attachment; filename="valle-qr-report-${stamp}.xlsx"`);
       await wb.xlsx.write(res);
       res.end();
     } catch (err) {
@@ -372,9 +451,19 @@ const PAGE = `<!doctype html>
     --paper:#F7F4EF; --card:#FFFFFF; --line:#E6E0D6;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.5 'Work Sans',system-ui,sans-serif;
-       -webkit-font-smoothing:antialiased}
+  body{margin:0;color:var(--ink);font:14px/1.5 'Work Sans',system-ui,sans-serif;
+       -webkit-font-smoothing:antialiased;
+       background:
+         radial-gradient(720px 420px at 88% -4%, rgba(115,51,255,.14), transparent 62%),
+         radial-gradient(640px 400px at -8% 28%, rgba(255,51,88,.09), transparent 62%),
+         radial-gradient(760px 520px at 55% 112%, rgba(51,255,116,.10), transparent 62%),
+         var(--paper);
+       background-attachment:fixed}
   .num,.mono{font-family:'Chivo Mono',monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
+  /* frosted glass surfaces */
+  .glass{background:rgba(255,255,255,.58);
+         -webkit-backdrop-filter:blur(16px) saturate(1.35);backdrop-filter:blur(16px) saturate(1.35);
+         border:1px solid rgba(255,255,255,.8)}
   :is(input,select,button):focus-visible{outline:3px solid #C9B8FF;outline-offset:1px}
 
   /* header on the Slope */
@@ -394,7 +483,7 @@ const PAGE = `<!doctype html>
 
   /* KPI tiles */
   .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:12px;margin-top:-14px;position:relative}
-  .tile{background:var(--card);border:1px solid #EFEAE0;border-radius:14px;padding:14px 16px;border-bottom:3px solid var(--indigo);
+  .tile{background:rgba(255,255,255,.58);-webkit-backdrop-filter:blur(16px) saturate(1.35);backdrop-filter:blur(16px) saturate(1.35);border:1px solid rgba(255,255,255,.8);border-radius:14px;padding:14px 16px;border-bottom:3px solid var(--indigo);
         box-shadow:0 1px 2px rgba(34,19,58,.04),0 10px 28px -20px rgba(34,19,58,.22)}
   .tile .n{font:600 24px 'Chivo Mono',monospace;color:var(--purple)}
   .tile .l{font-size:11px;color:var(--dim);letter-spacing:.07em;text-transform:uppercase;font-weight:600}
@@ -404,15 +493,16 @@ const PAGE = `<!doctype html>
   /* charts */
   .charts{display:grid;grid-template-columns:2fr 1fr;gap:14px}
   @media(max-width:860px){.charts{grid-template-columns:1fr}}
-  .panel{background:var(--card);border:1px solid #EFEAE0;border-radius:16px;padding:14px;
+  .panel{background:rgba(255,255,255,.58);-webkit-backdrop-filter:blur(16px) saturate(1.35);backdrop-filter:blur(16px) saturate(1.35);border:1px solid rgba(255,255,255,.8);border-radius:16px;padding:14px;
          box-shadow:0 1px 2px rgba(34,19,58,.04),0 10px 28px -18px rgba(34,19,58,.25)}
   .panel h3{margin:0 0 8px;font:600 12px 'Work Sans';color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
   .panel .cv{position:relative;height:210px}
 
   /* toolbar */
   .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 10px}
-  .bar input[type=search]{flex:1;min-width:190px;padding:9px 13px;border:1px solid var(--line);border-radius:10px;font:inherit;background:#fff}
-  .bar select{padding:9px 10px;border:1px solid var(--line);border-radius:10px;font:inherit;background:#fff;color:var(--ink)}
+  .bar input[type=search],.bar input[type=date]{flex:1;min-width:170px;padding:9px 13px;border:1px solid rgba(255,255,255,.9);border-radius:10px;font:inherit;background:rgba(255,255,255,.72);color:var(--ink)}
+  .bar input[type=date]{flex:0 1 auto;min-width:150px}
+  .bar select{padding:9px 10px;border:1px solid rgba(255,255,255,.9);border-radius:10px;font:inherit;background:rgba(255,255,255,.72);color:var(--ink)}
   .btn{border:0;border-radius:11px;padding:9px 14px;font:600 13px 'Work Sans';cursor:pointer;white-space:nowrap;
        transition:transform .12s,box-shadow .12s,opacity .12s}
   .btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 6px 16px -8px rgba(34,19,58,.4)}
@@ -425,7 +515,7 @@ const PAGE = `<!doctype html>
   .count{font-size:12px;color:var(--dim);margin-left:auto}
 
   /* tables */
-  .card{background:var(--card);border:1px solid #EFEAE0;border-radius:16px;overflow-x:auto;
+  .card{background:rgba(255,255,255,.58);-webkit-backdrop-filter:blur(16px) saturate(1.35);backdrop-filter:blur(16px) saturate(1.35);border:1px solid rgba(255,255,255,.8);border-radius:16px;overflow-x:auto;
         box-shadow:0 1px 2px rgba(34,19,58,.04),0 10px 28px -18px rgba(34,19,58,.25)}
   /* long lists scroll inside the card, the header row stays put */
   .card.scroll{max-height:420px;overflow-y:auto}
@@ -436,7 +526,7 @@ const PAGE = `<!doctype html>
   table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:680px}
   th{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);text-align:left;font-weight:600}
   th,td{padding:9px 14px;border-top:1px solid #F0EDE5;vertical-align:middle}
-  thead th{border-top:none;background:#FBFAF6}
+  thead th{border-top:none;background:rgba(251,250,246,.92)}
   tbody tr.click{cursor:pointer} tbody tr.click:hover{background:#F6F2FF}
   .pill{display:inline-block;color:#fff;font-size:11px;font-weight:600;padding:1px 9px;border-radius:99px;white-space:nowrap}
   .dim{color:#B4ABC4}
@@ -447,7 +537,7 @@ const PAGE = `<!doctype html>
   /* modal */
   .overlay{position:fixed;inset:0;background:rgba(34,19,58,.55);display:none;align-items:center;justify-content:center;padding:16px;z-index:50}
   .overlay.open{display:flex}
-  .modal{background:var(--paper);border-radius:16px;max-width:640px;width:100%;max-height:86vh;display:flex;flex-direction:column;overflow:hidden}
+  .modal{background:rgba(247,244,239,.92);-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px);border-radius:16px;max-width:640px;width:100%;max-height:86vh;display:flex;flex-direction:column;overflow:hidden}
   .modal header{padding:14px 18px;background:var(--purple);overflow:visible}
   .modal header::after{display:none}
   .modal h4{margin:0;color:#fff;font:italic 800 16px Barlow}
@@ -467,7 +557,7 @@ const PAGE = `<!doctype html>
 
   @media print{
     header .lines,.bar,.btn,#toast,.overlay{display:none!important}
-    body{background:#fff} .card,.panel,.tile{border-color:#ccc;break-inside:avoid}
+    body{background:#fff} .card,.panel,.tile{background:#fff!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important;border-color:#ccc;break-inside:avoid}
     .charts{display:block} .panel{margin-bottom:12px}
   }
 </style></head><body>
@@ -509,6 +599,7 @@ const PAGE = `<!doctype html>
     <select id="fMode"><option value="">Mode: all</option><option value="bot">bot</option><option value="human">human</option><option value="waiting">waiting</option><option value="paused">paused</option><option value="__needs">needs a person</option></select>
     <select id="fEmail"><option value="">Email: all</option><option value="has">captured</option><option value="sent">overview sent</option><option value="unsent">captured, not sent</option><option value="none">none</option></select>
     <select id="fWhen"><option value="">Seen: any time</option><option value="1">today</option><option value="7">last 7 days</option></select>
+    <input type="date" id="fDay" title="Only records created on this exact day (scans and first contacts)">
     <button class="btn go" id="xlsx" title="Excel workbook: every QR guest with number and scan time, the daily timeline, and the hourly profile with the peak">Excel report</button>
     <button class="btn ghost" id="csv">CSV</button>
     <button class="btn ghost" onclick="window.print()">Print</button>
@@ -516,7 +607,7 @@ const PAGE = `<!doctype html>
     <span class="count" id="count"></span>
   </div>
   <div class="card scroll"><table>
-    <thead><tr><th>Guest</th><th>Number</th><th>Email</th><th>Source</th><th>Mode</th><th>Last seen</th><th></th></tr></thead>
+    <thead><tr><th>Guest</th><th>Number</th><th>Country</th><th>Email</th><th>Source</th><th>Mode</th><th>Last seen</th><th></th></tr></thead>
     <tbody id="rows"></tbody>
   </table></div>
 
@@ -546,6 +637,8 @@ const KEY = new URLSearchParams(location.search).get('key');
 const api = (p) => p + (p.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(KEY);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const when = (d) => d ? new Intl.DateTimeFormat('en-GB',{timeZone:'${TZ}',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}).format(new Date(d)) : '';
+const dayOf = (d) => d ? new Date(d).toLocaleDateString('en-CA', { timeZone: '${TZ}' }) : '';
+const timeOf = (d) => d ? new Date(d).toLocaleTimeString('en-GB', { timeZone: '${TZ}', hour12: false }) : '';
 const C = { purple:'#340057', scarlet:'#FF3358', indigo:'#7333FF', yellow:'#FFFC33', green:'#33FF74', lavender:'#EBE2FF', dim:'#7A6E8C' };
 const MODE_COLORS = { bot:'#1E8A4C', waiting:'#B8860B', human:C.indigo, paused:C.dim };
 
@@ -645,35 +738,10 @@ function drawCharts() {
       y: { ticks: { precision: 0 }, title: { display: true, text: 'messages' } },
       y2: { position: 'right', grid: { drawOnChartArea: false }, ticks: { precision: 0 }, title: { display: true, text: 'scans' } } } } });
 
-  // Country of each guest from the number's dialling prefix. Every prefix we
-  // have ever seen is named; only a truly unknown code shows as Unrecognised.
-  const PREFIX = { '230':'Mauritius','971':'UAE','966':'Saudi Arabia','974':'Qatar','965':'Kuwait','973':'Bahrain',
-    '968':'Oman','91':'India','92':'Pakistan','880':'Bangladesh','94':'Sri Lanka','977':'Nepal',
-    '44':'United Kingdom','33':'France','49':'Germany','39':'Italy','34':'Spain','351':'Portugal',
-    '41':'Switzerland','43':'Austria','32':'Belgium','31':'Netherlands','352':'Luxembourg','353':'Ireland',
-    '45':'Denmark','46':'Sweden','47':'Norway','358':'Finland','48':'Poland','420':'Czechia','36':'Hungary',
-    '30':'Greece','40':'Romania','359':'Bulgaria','385':'Croatia','381':'Serbia','386':'Slovenia',
-    '356':'Malta','357':'Cyprus','7':'Russia','380':'Ukraine','90':'Türkiye','972':'Israel',
-    '961':'Lebanon','962':'Jordan','963':'Syria','964':'Iraq','98':'Iran','93':'Afghanistan',
-    '20':'Egypt','212':'Morocco','213':'Algeria','216':'Tunisia','218':'Libya','249':'Sudan',
-    '251':'Ethiopia','254':'Kenya','255':'Tanzania','256':'Uganda','250':'Rwanda','257':'Burundi',
-    '260':'Zambia','263':'Zimbabwe','258':'Mozambique','265':'Malawi','267':'Botswana','264':'Namibia',
-    '27':'South Africa','262':'Réunion','261':'Madagascar','248':'Seychelles','269':'Comoros','290':'St Helena',
-    '234':'Nigeria','233':'Ghana','225':'Ivory Coast','221':'Senegal','237':'Cameroon',
-    '86':'China','852':'Hong Kong','853':'Macau','886':'Taiwan','81':'Japan','82':'South Korea',
-    '84':'Vietnam','66':'Thailand','60':'Malaysia','65':'Singapore','62':'Indonesia','63':'Philippines',
-    '855':'Cambodia','856':'Laos','95':'Myanmar','673':'Brunei','960':'Maldives',
-    '61':'Australia','64':'New Zealand','679':'Fiji',
-    '1':'USA / Canada','52':'Mexico','55':'Brazil','54':'Argentina','56':'Chile','57':'Colombia','51':'Peru',
-    '598':'Uruguay','593':'Ecuador','591':'Bolivia','58':'Venezuela','506':'Costa Rica','507':'Panama',
-    '509':'Haiti','53':'Cuba','976':'Mongolia','996':'Kyrgyzstan','998':'Uzbekistan','7 7':'Kazakhstan',
-    '994':'Azerbaijan','995':'Georgia','374':'Armenia' };
+  // Country comes from the server (one shared dialling-prefix map with the
+  // Excel report), so the chart, the table and the workbook always agree.
   const byCountry = {};
-  for (const c of D.contacts) {
-    const id = String(c.wa_id);
-    const name = PREFIX[id.slice(0, 3)] || PREFIX[id.slice(0, 2)] || PREFIX[id.slice(0, 1)] || 'Unrecognised';
-    byCountry[name] = (byCountry[name] || 0) + 1;
-  }
+  for (const c of D.contacts) byCountry[c.country || 'Unrecognised'] = (byCountry[c.country || 'Unrecognised'] || 0) + 1;
   const top = Object.entries(byCountry).sort((a, b) => b[1] - a[1]).slice(0, 12);
   const PALETTE = [C.purple, C.scarlet, C.indigo, '#0F7A3D', '#B8860B', '#0B7285',
                    '#A61E4D', '#5C40B5', '#2B6CB0', '#846358', '#556B2F', C.dim];
@@ -755,9 +823,11 @@ function filtered() {
   const fm = document.getElementById('fMode').value;
   const fe = document.getElementById('fEmail').value;
   const fw = document.getElementById('fWhen').value;
+  const fd = document.getElementById('fDay').value;
   const cutoff = fw ? Date.now() - Number(fw) * 864e5 : 0;
   return D.contacts.filter((c) => {
-    if (qv && !((c.profile_name || '') + ' ' + c.wa_id + ' ' + (c.email || '')).toLowerCase().includes(qv)) return false;
+    if (qv && !((c.profile_name || '') + ' ' + c.wa_id + ' ' + (c.email || '') + ' ' + (c.country || '')).toLowerCase().includes(qv)) return false;
+    if (fd && dayOf(c.created_at) !== fd) return false;
     if (fs === '__none' ? c.source : (fs && c.source !== fs)) return false;
     if (fm === '__needs' ? !c.bot_silent : (fm && c.mode !== fm)) return false;
     if (fe === 'has'    && !c.email) return false;
@@ -779,13 +849,14 @@ function renderRows() {
     <tr class="click" data-wa="\${esc(c.wa_id)}">
       <td>\${esc(c.profile_name || c.wa_id)}</td>
       <td class="num">\${esc(c.wa_id)}</td>
+      <td>\${esc(c.country || '')}</td>
       <td>\${c.email ? esc(c.email) + (c.email_at ? ' <span class="mail-ok">Sent</span>' : '') : '<span class="dim">·</span>'}</td>
       <td>\${c.source ? pill(c.source, '#14432A') : '<span class="dim">·</span>'}</td>
       <td>\${modePill(c)}</td>
       <td class="num">\${when(c.last_seen_at)}</td>
       <td><button class="btn ghost sm" data-mail="\${esc(c.wa_id)}" \${D.emailEnabled ? '' : 'disabled'}>Email</button></td>
     </tr>\`).join('')
-    : '<tr><td colspan="7" class="empty">No guests match these filters.</td></tr>';
+    : '<tr><td colspan="8" class="empty">No guests match these filters.</td></tr>';
 }
 
 function renderWaiting() {
@@ -846,7 +917,7 @@ async function sendOverview(waId, typedEmail) {
 }
 
 /* ── events ── */
-for (const id of ['q', 'fSource', 'fMode', 'fEmail', 'fWhen'])
+for (const id of ['q', 'fSource', 'fMode', 'fEmail', 'fWhen', 'fDay'])
   document.getElementById(id).addEventListener('input', renderRows);
 
 document.getElementById('rows').addEventListener('click', (e) => {
@@ -882,15 +953,23 @@ document.getElementById('emailAll').addEventListener('click', async () => {
 });
 
 document.getElementById('xlsx').addEventListener('click', () => {
-  location.href = api('/dashboard/report.xlsx');
+  const fd = document.getElementById('fDay').value;
+  const fw = document.getElementById('fWhen').value;
+  const today = dayOf(new Date());
+  let range = '';
+  if (fd) range = '&from=' + fd + '&to=' + fd;
+  else if (fw === '1') range = '&from=' + today + '&to=' + today;
+  else if (fw === '7') range = '&from=' + dayOf(new Date(Date.now() - 6 * 864e5)) + '&to=' + today;
+  location.href = api('/dashboard/report.xlsx') + range;
 });
 
 document.getElementById('csv').addEventListener('click', () => {
   const rows = filtered();
   const cell = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
-  const csv = ['Guest,Number,Email,Overview sent,Source,Mode,Last seen',
-    ...rows.map((c) => [c.profile_name || '', c.wa_id, c.email || '', c.email_at ? when(c.email_at) : '',
-      c.source || '', c.bot_silent ? 'needs a person' : c.mode, when(c.last_seen_at)].map(cell).join(','))].join('\\n');
+  const csv = ['Guest,Number,Country,Email,Overview sent,Source,Mode,Scan date,Scan time,Last seen',
+    ...rows.map((c) => [c.profile_name || '', c.wa_id, c.country || '', c.email || '', c.email_at ? when(c.email_at) : '',
+      c.source || '', c.bot_silent ? 'needs a person' : c.mode,
+      dayOf(c.created_at), timeOf(c.created_at), when(c.last_seen_at)].map(cell).join(','))].join('\\n');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob(['\\ufeff' + csv], { type: 'text/csv' }));
   a.download = 'valle-guests-' + new Date().toISOString().slice(0, 10) + '.csv';
