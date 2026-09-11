@@ -427,6 +427,12 @@ const PAGE = `<!doctype html>
   /* tables */
   .card{background:var(--card);border:1px solid #EFEAE0;border-radius:16px;overflow-x:auto;
         box-shadow:0 1px 2px rgba(34,19,58,.04),0 10px 28px -18px rgba(34,19,58,.25)}
+  /* long lists scroll inside the card, the header row stays put */
+  .card.scroll{max-height:420px;overflow-y:auto}
+  .card.scroll thead th{position:sticky;top:0;z-index:1;box-shadow:0 1px 0 #F0EDE5}
+  .card.scroll::-webkit-scrollbar{width:10px;height:10px}
+  .card.scroll::-webkit-scrollbar-thumb{background:#D8D2E6;border-radius:99px;border:2px solid var(--card)}
+  .card.scroll::-webkit-scrollbar-track{background:transparent}
   table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:680px}
   th{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);text-align:left;font-weight:600}
   th,td{padding:9px 14px;border-top:1px solid #F0EDE5;vertical-align:middle}
@@ -494,7 +500,7 @@ const PAGE = `<!doctype html>
   </div>
 
   <h2>Awaiting a reply</h2>
-  <div class="card" id="unanswered"></div>
+  <div class="card scroll" id="unanswered"></div>
 
   <h2>Guests</h2>
   <div class="bar">
@@ -509,7 +515,7 @@ const PAGE = `<!doctype html>
     <button class="btn hot" id="emailAll" title="Overview email to every QR guest with a captured address who has not received it">Email all ATM scans</button>
     <span class="count" id="count"></span>
   </div>
-  <div class="card"><table>
+  <div class="card scroll"><table>
     <thead><tr><th>Guest</th><th>Number</th><th>Email</th><th>Source</th><th>Mode</th><th>Last seen</th><th></th></tr></thead>
     <tbody id="rows"></tbody>
   </table></div>
@@ -521,7 +527,7 @@ const PAGE = `<!doctype html>
   <div class="card" id="leads"></div>
 
   <h2>Latest messages</h2>
-  <div class="card" id="feed"></div>
+  <div class="card scroll" id="feed"></div>
 </div>
 
 <div class="overlay" id="overlay"><div class="modal">
