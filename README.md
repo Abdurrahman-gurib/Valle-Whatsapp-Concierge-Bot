@@ -116,7 +116,9 @@ These are enforced in code and covered by the test suite:
 
 1. A guest scans a QR code and sends the prefilled message.
 2. The bot recognises the QR wording, tags the guest with its source, and greets them with
-   the menu. Anyone who never scanned a QR is stored but receives no reply (`QR_ONLY`).
+   the menu. The welcome ends by asking for their email address: the number and country
+   come with the scan, the email is the one detail WhatsApp never provides. Anyone who
+   never scanned a QR is stored but receives no reply (`QR_ONLY`).
 3. Menu taps and keywords answer instantly from `knowledge/valle-kb.md`: prices, activities,
    packages, dining, kids, hours, the park map, photos and PDFs.
 4. Anything else goes to Claude, which replies in the guest's own language, sees photos they
@@ -135,7 +137,9 @@ These are enforced in code and covered by the test suite:
 `#info <number>` · `#ask <question>` · `#boton` / `#botoff`
 
 A read-only web view is available at `/dashboard?key=<DASHBOARD_KEY>`: live counters, the
-waiting queue, captured leads, recent conversations and the latest messages.
+waiting queue, captured leads, recent conversations and the latest messages. Photos, voice
+notes, PDFs and videos a guest sends, and files the team sends from the app, are kept in
+the database (up to 12 MB each) and open straight from the conversation viewer.
 
 ---
 

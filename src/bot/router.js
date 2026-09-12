@@ -85,19 +85,19 @@ async function askForEmail(contact) {
 }
 
 /**
- * The moment a guest scans the QR code and the welcome menu has gone out, ask
- * for their email so the overview lands in their inbox while they are still on
- * the stand. Asked once per guest. They can ignore it: the next message they
- * send is answered normally and the question is dropped (see handleEmailReply).
+ * Whether the welcome should end by asking for the guest's email address. It
+ * is the one detail WhatsApp never gives us (number and country come with the
+ * scan), so the welcome asks for it, every scan, until we have it. Nobody is
+ * trapped: the next message they send is answered normally and the question
+ * is dropped (see handleEmailReply).
  */
-async function inviteEmailAfterScan(contact) {
-  if (!emailEnabled() || contact.email) return;
-  if (await db.hasLoggedMarker(contact.id, '[email: offered]')) return;
-  await sendText(contact.wa_id,
-    `Would you like the full Vallé overview in your inbox as well? 📧 ` +
-    `Just reply with your email address and I will send it straight away.`);
+const shouldAskEmail = (contact) => emailEnabled() && !contact.email;
+
+/** The welcome asked for the address: the chat is now waiting on it. */
+async function noteEmailAsked(contact) {
   await db.setAwaiting(contact.wa_id, 'email');
   contact.awaiting = 'email';
+  if (await db.hasLoggedMarker(contact.id, '[email: offered]')) return;
   await db.logMessage({
     contactId: contact.id, direction: 'out', author: 'system', body: '[email: offered]',
   });
@@ -208,14 +208,14 @@ export async function handleStaffEcho(echo) {
   const contact = await db.getContactByWaId(guest);
   if (!contact) return;                       // never a guest of ours
 
-  const body = echo?.text?.body || `[${echo?.type || 'message'} from the team]`;
+  const body = echo?.text?.body || describeMedia(echo, 'from the team');
 
   if (contact.mode !== 'human') {
     await db.setMode(guest, 'human', APP_AGENT);
     console.log('[router] a colleague replied from the WhatsApp app — bot paused for', guest);
   }
 
-  await db.logMessage({
+  const messageId = await db.logMessageId({
     contactId: contact.id,
     waMessageId: echoId,
     direction: 'out',
@@ -223,6 +223,8 @@ export async function handleStaffEcho(echo) {
     authorWaId: APP_AGENT,
     body,
   });
+  // A photo or a PDF the colleague sent is kept for the dashboard as well.
+  captureAttachment(messageId, mediaOf(echo));
 }
 
 /**
@@ -276,16 +278,21 @@ export async function handleIncomingMessage(msg, contactProfile) {
   /* ---- 2. Normal guest ---- */
   const contact = await db.getOrCreateContact(from, profileName);
 
-  const isNew = await db.logMessage({
+  const messageId = await db.logMessageId({
     contactId: contact.id,
     waMessageId,
     direction: 'in',
     author: 'customer',
-    body: text,
+    // A photo, voice note or file is stored in words the team can read on the
+    // dashboard ("[photo] our group", "[document] rates.pdf"); the file itself
+    // follows, see captureAttachment.
+    body: text || describeMedia(msg),
     msgType: msg.type,
   });
   // Meta retries webhooks; without this a retry would answer the guest twice.
-  if (!isNew) return;
+  if (!messageId) return;
+  // Kept for every chat, the team's included: the guest never waits for it.
+  const kept = captureAttachment(messageId, mediaOf(msg));
 
   // Tag which QR they came from — the first message that matches a QR
   // prefill unlocks the bot for this contact, permanently.
@@ -386,17 +393,14 @@ export async function handleIncomingMessage(msg, contactProfile) {
 
   /* ---- 5b. Voice notes: transcribe, then answer in the guest's language ---- */
   if (!text && (msg.type === 'audio' || msg.type === 'voice')) {
-    await handleVoiceNote(contact, msg, profileName, waMessageId);
+    await handleVoiceNote(contact, msg, profileName, waMessageId, kept);
     return;
   }
 
   /* ---- 5c. Photos: the AI looks at them and reacts ---- */
   if (!text && msg.type === 'image' && msg.image?.id && config.bot.mode !== 'menu') {
     try {
-      const { buffer, mime } = await downloadMedia(msg.image.id);
-      await db.logMessage({
-        contactId: contact.id, direction: 'in', author: 'system', body: '[photo received]',
-      });
+      const { buffer, mime } = (await kept) || await downloadMedia(msg.image.id);
       await respondWithAI(contact, msg.image.caption || '', profileName, waMessageId, {
         image: { data: buffer.toString('base64'), media_type: (mime || 'image/jpeg').split(';')[0] },
       });
@@ -407,6 +411,10 @@ export async function handleIncomingMessage(msg, contactProfile) {
   }
 
   /* ---- 5d. Other non-text media: acknowledge, don't try to interpret ---- */
+  // A reaction, an edit or a deleted message is not an attachment: there is
+  // nothing to acknowledge, and "I can't open attachments" in reply to a
+  // thumbs-up would look broken.
+  if (!text && ['reaction', 'edit', 'revoke'].includes(msg.type)) return;
   if (!text) {
     await sendText(from,
       `Thanks! 📎 I can't open attachments yet, but I've flagged this for the team. ` +
@@ -428,8 +436,9 @@ async function routeGuestText(contact, text, profileName, waMessageId, { firstSc
     // A QR prefill always opens with the welcome menu, first scan or re-scan,
     // and must never be mistaken for a booking enquiry.
     if (firstScan || isQrPrefillText(text)) {
-      await sendMenuWelcome(contact);
-      await inviteEmailAfterScan(contact);
+      const askEmail = shouldAskEmail(contact);
+      await sendMenuWelcome(contact, { askEmail });
+      if (askEmail) await noteEmailAsked(contact);
       return;
     }
     if (wantsHuman(text)) {
@@ -582,13 +591,13 @@ async function respondWithAI(contact, text, profileName, waMessageId, { voiceRep
  * failure), the guest gets a polite reply and the note goes to the team, who
  * can listen to it in the WhatsApp app.
  */
-async function handleVoiceNote(contact, msg, profileName, waMessageId) {
+async function handleVoiceNote(contact, msg, profileName, waMessageId, kept = null) {
   const media = msg.audio || msg.voice;
   let transcript = null;
 
   try {
     if (media?.id) {
-      const { buffer, mime } = await downloadMedia(media.id);
+      const { buffer, mime } = (await kept) || await downloadMedia(media.id);
       transcript = await transcribeAudio(buffer, mime || media.mime_type);
     }
   } catch (err) {
@@ -953,6 +962,83 @@ async function sendMainMenu(contact) {
 }
 
 /* ═══════════════════════ HELPERS ═══════════════════════ */
+
+/**
+ * What a message carried when it was not text, in words the team can read on
+ * the dashboard: "[photo] our group", "[voice note]", "[document] rates.pdf".
+ * The file itself is kept by captureAttachment. With a suffix, the same words
+ * describe what a colleague sent from the app: "[photo from the team]".
+ */
+function describeMedia(msg, suffix = '') {
+  const tag = (kind) => `[${kind}${suffix ? ' ' + suffix : ''}]`;
+  const caption = (m) => (m?.caption ? ' ' + m.caption : '');
+  switch (msg?.type) {
+    case 'image':    return tag('photo') + caption(msg.image);
+    case 'sticker':  return tag('sticker');
+    case 'video':    return tag('video') + caption(msg.video);
+    case 'audio':    return tag(msg.audio?.voice ? 'voice note' : 'audio');
+    case 'voice':    return tag('voice note');
+    case 'document': return tag('document')
+      + (msg.document?.filename ? ' ' + msg.document.filename : caption(msg.document));
+    case 'location': {
+      const l = msg.location || {};
+      const where = [l.name, l.address, [l.latitude, l.longitude].filter((v) => v != null).join(',')]
+        .filter(Boolean).join(' · ');
+      return `${tag('location')} ${where}`.trim();
+    }
+    case 'contacts': {
+      const names = (msg.contacts || []).map((c) => c.name?.formatted_name).filter(Boolean).join(', ');
+      return `${tag('contact card')} ${names}`.trim();
+    }
+    case 'reaction': return `${tag('reaction')} ${msg.reaction?.emoji || ''}`.trim();
+    case 'revoke':   return tag('message deleted');
+    case 'edit':     return tag('message edited');
+    default:         return tag(msg?.type || 'message');
+  }
+}
+
+/** The message types that carry a file worth keeping. */
+const KEPT_MEDIA = ['image', 'sticker', 'video', 'audio', 'voice', 'document'];
+
+/** The media id, mime and file name a message carries, or null when it has no file. */
+function mediaOf(msg) {
+  const type = msg?.type;
+  if (!KEPT_MEDIA.includes(type)) return null;
+  const media = msg[type];
+  if (!media?.id) return null;
+  return { id: media.id, mime: (media.mime_type || '').split(';')[0], filename: media.filename || null };
+}
+
+/** Files above this are described but not stored. WhatsApp itself allows 100 MB. */
+const ATTACHMENT_CAP = 12 * 1024 * 1024;
+
+/**
+ * Keep what was sent so the team can open it on the dashboard: the photo, the
+ * voice note, the PDF. Off the critical path and never throws: a failed
+ * download costs the guest nothing, the message keeps its label. Resolves to
+ * the downloaded file, so a caller that needs the bytes anyway (the assistant
+ * looking at a photo, the transcriber) does not fetch them twice.
+ */
+function captureAttachment(messageId, media) {
+  if (!messageId || !media) return Promise.resolve(null);
+  return downloadMedia(media.id)
+    .then(async (file) => {
+      const mime = media.mime || (file.mime || 'application/octet-stream').split(';')[0];
+      if (file.buffer.length > ATTACHMENT_CAP) {
+        console.warn('[attachment] too large to keep', media.id, file.buffer.length);
+      } else {
+        await db.saveAttachment({
+          messageId, waMediaId: media.id, mime, filename: media.filename,
+          size: file.buffer.length, bytes: file.buffer,
+        });
+      }
+      return file;
+    })
+    .catch((err) => {
+      console.error('[attachment] could not keep', media.id, err.message);
+      return null;
+    });
+}
 
 /** Pulls text out of every message shape WhatsApp sends. */
 function extractText(msg) {

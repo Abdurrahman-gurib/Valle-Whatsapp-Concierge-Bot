@@ -629,6 +629,10 @@ console.log('\n15. QR-only gate: strangers get silence, QR scanners get replies'
   await sendMenuWelcome(await dbMod.getContactByWaId(GUEST));
   check('menu refused → guest still gets a text welcome',
     sent.slice(before22).some((m) => m.text?.body?.includes('Welcome to')));
+  before22 = sent.length;
+  await sendMenuWelcome(await dbMod.getContactByWaId(GUEST), { askEmail: true });
+  check('and the text welcome carries the email question too',
+    sent.slice(before22).some((m) => /Welcome to/.test(m.text?.body || '') && /email address/i.test(m.text?.body || '')));
   globalThis.fetch = failing;
 
   // (h) A human-handled chat is never auto-released back to the bot.
@@ -1670,12 +1674,15 @@ console.log('\n32. A scan also texts their phone; the overview goes out by email
   const scan = await say(ATM);
   await new Promise((r) => setImmediate(r));  // the SMS is fire and forget
 
-  check('right after the scan, the guest is asked for their email',
-    scan.some((m) => /email address/i.test(m.text?.body || '')));
-  check('and the chat is waiting on it', (await dbMod.getContactByWaId(G)).awaiting === 'email');
-  check('the welcome menu still went out first',
-    scan.findIndex((m) => m.interactive) < scan.findIndex((m) => /email address/i.test(m.text?.body || '')));
   const welcomeBody = scan.find((m) => m.interactive)?.interactive?.body?.text || '';
+  check('the welcome itself asks for the email address: one message after the scan, not two',
+    /email address/i.test(welcomeBody) && !scan.some((m) => /email address/i.test(m.text?.body || '')),
+    welcomeBody.slice(-160));
+  check('and says why: number and country are known, the email completes the details',
+    /save your details/i.test(welcomeBody) && /number and country/i.test(welcomeBody));
+  check('the whole ask survived the 1024 characters WhatsApp allows in a list body',
+    /all that is missing/i.test(welcomeBody), `${welcomeBody.length} chars`);
+  check('and the chat is waiting on it', (await dbMod.getContactByWaId(G)).awaiting === 'email');
   check('the welcome tells the guest they can send a voice note and ask anything',
     /voice note/i.test(welcomeBody) && /prices/i.test(welcomeBody) && /photos/i.test(welcomeBody)
     && /map/i.test(welcomeBody) && /menus/i.test(welcomeBody),
@@ -1979,6 +1986,160 @@ console.log('\n33. Restaurant menus: the à la carte card and the two set menus'
   const menuSrc = fsM.readFileSync(new URL('../src/bot/menu-bot.js', import.meta.url), 'utf8');
   check('the dining card no longer contradicts it',
     /Le Chamouzé\*: our waterfall restaurant, daily/.test(menuSrc));
+}
+
+/* ═══ 34. What guests send reaches the dashboard: photos, voice notes, files ═══ */
+console.log('\n34. Attachments: described in words, kept in the database, served to the dashboard');
+{
+  const { handleIncomingMessage, handleStaffEcho } = await import('../src/bot/router.js');
+  const { mountDashboard } = await import('../src/web/dashboard.js');
+  const { config: cfg } = await import('../src/core/config.js');
+  const express = (await import('express')).default;
+  const http = (await import('node:http')).default;
+  cfg.bot.mode = 'hybrid';
+  cfg.wa.provider = 'meta';
+  cfg.dashboardKey = 'test-dashboard-key';
+
+  const ATM = 'Greetings! It was lovely meeting you at ATM Dubai 2026. I am excited to discover more about Vallé Advenature Park and the unforgettable experiences it offers in Mauritius.';
+  const G = '971555000034';
+  const bytesOf = { PHOTO1: [255, 216, 255, 224, 1, 2], VOICE1: [79, 103, 103, 83], DOC1: [37, 80, 68, 70, 45], TEAM1: [9, 8, 7] };
+  const mimeOf = { PHOTO1: 'image/jpeg', VOICE1: 'audio/ogg; codecs=opus', DOC1: 'application/pdf', TEAM1: 'image/png' };
+  const sent = [];
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    if (u.includes('lookaside')) {                       // the bytes
+      return new Response(new Uint8Array(bytesOf[u.split('/').pop()]), { status: 200 });
+    }
+    const id = (u.match(/\/(PHOTO1|VOICE1|DOC1|TEAM1)$/) || [])[1];
+    if (id) {                                            // the media info lookup
+      return new Response(JSON.stringify({ url: 'https://lookaside.fbsbx.com/' + id, mime_type: mimeOf[id] }),
+        { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    const p = JSON.parse(opts?.body || '{}');
+    if (!p.status) sent.push(p);
+    return new Response(JSON.stringify({ messages: [{ id: 'wamid.att.out.' + sent.length }] }),
+      { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const settle = () => new Promise((r) => setTimeout(r, 60));   // the capture runs off the critical path
+  const stored = async (waId) => (await dbMod.q(
+    `SELECT m.body, m.msg_type, a.mime, a.filename, a.size
+       FROM messages m
+       JOIN contacts c ON c.id = m.contact_id
+       LEFT JOIN attachments a ON a.message_id = m.id
+      WHERE c.wa_id = $1 AND m.direction = 'in'
+      ORDER BY m.id ASC`, [waId])).rows;
+  // The dashboard is exercised over real HTTP, untouched by the fetch stub.
+  const get = (url) => new Promise((resolve, reject) => {
+    http.get(url, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+    }).on('error', reject);
+  });
+
+  // (a) A QR guest sends a photo with a caption.
+  await handleIncomingMessage(inbound(G, ATM), { wa_id: G, profile: { name: 'Noor' } });
+  globalThis.__aiReply = 'What a lovely picture!';
+  await handleIncomingMessage(
+    { from: G, id: 'wamid.att.1', type: 'image', image: { id: 'PHOTO1', mime_type: 'image/jpeg', caption: 'our group' } },
+    { wa_id: G, profile: { name: 'Noor' } });
+  globalThis.__aiReply = null;
+  await settle();
+  let rows = await stored(G);
+  const photo = rows.find((r) => r.msg_type === 'image');
+  check('a photo is stored in words: "[photo] caption"', photo?.body === '[photo] our group', photo?.body);
+  check('and the file itself is kept with its type and size',
+    photo?.mime === 'image/jpeg' && photo?.size === bytesOf.PHOTO1.length, `${photo?.mime} ${photo?.size}`);
+  check('the assistant still saw and answered the photo',
+    sent.some((m) => m.text?.body === 'What a lovely picture!'));
+
+  // (b) A voice note, with no transcription key: handed to the team, and kept.
+  cfg.stt.openaiKey = '';
+  await handleIncomingMessage(
+    { from: G, id: 'wamid.att.2', type: 'audio', audio: { id: 'VOICE1', mime_type: 'audio/ogg; codecs=opus', voice: true } },
+    { wa_id: G, profile: { name: 'Noor' } });
+  await settle();
+  rows = await stored(G);
+  const voice = rows.find((r) => r.msg_type === 'audio');
+  check('a voice note is stored as "[voice note]"', voice?.body === '[voice note]', voice?.body);
+  check('kept as audio/ogg, the codec suffix dropped',
+    voice?.mime === 'audio/ogg' && voice?.size === bytesOf.VOICE1.length, `${voice?.mime} ${voice?.size}`);
+
+  // (c) A PDF keeps its file name.
+  await dbMod.setMode(G, 'bot');
+  await handleIncomingMessage(
+    { from: G, id: 'wamid.att.3', type: 'document', document: { id: 'DOC1', mime_type: 'application/pdf', filename: 'our-rates.pdf' } },
+    { wa_id: G, profile: { name: 'Noor' } });
+  await settle();
+  rows = await stored(G);
+  const doc = rows.find((r) => r.msg_type === 'document');
+  check('a document is stored with its file name', doc?.body === '[document] our-rates.pdf', doc?.body);
+  check('and kept as a PDF', doc?.mime === 'application/pdf' && doc?.filename === 'our-rates.pdf', `${doc?.mime} ${doc?.filename}`);
+
+  // (d) A thumbs-up is not an attachment: stored, but no "I can't open attachments".
+  let before = sent.length;
+  await handleIncomingMessage(
+    { from: G, id: 'wamid.att.4', type: 'reaction', reaction: { message_id: 'wamid.att.out.1', emoji: '👍' } },
+    { wa_id: G, profile: { name: 'Noor' } });
+  check('a reaction is stored as "[reaction] 👍" and gets no reply',
+    (await stored(G)).some((r) => r.body === '[reaction] 👍') && sent.length === before, `sent ${sent.length - before}`);
+
+  // (e) A stranger's photo: still silence, still visible to the team.
+  const S = '23050000034';
+  before = sent.length;
+  await handleIncomingMessage(
+    { from: S, id: 'wamid.att.5', type: 'image', image: { id: 'PHOTO1', mime_type: 'image/jpeg' } },
+    { wa_id: S, profile: { name: 'Passant' } });
+  await settle();
+  const stranger = (await stored(S))[0];
+  check("a stranger's photo gets no reply but is kept for the dashboard",
+    sent.length === before && stranger?.body === '[photo]' && stranger?.mime === 'image/jpeg',
+    `sent ${sent.length - before} body=${stranger?.body}`);
+
+  // (f) What the team sends from the app is kept too.
+  await handleStaffEcho({ to: G, id: 'wamid.att.echo.1', type: 'image', image: { id: 'TEAM1', mime_type: 'image/png' } });
+  await settle();
+  const teamRow = (await dbMod.q(
+    `SELECT m.body, a.mime FROM messages m LEFT JOIN attachments a ON a.message_id = m.id
+      WHERE m.wa_message_id = 'wamid.att.echo.1'`)).rows[0];
+  check('a photo the team sends from the app reads "[photo from the team]" and is kept',
+    teamRow?.body === '[photo from the team]' && teamRow?.mime === 'image/png', JSON.stringify(teamRow));
+
+  // (g) The dashboard serves it all, behind its key.
+  const app = express();
+  app.use(express.json());
+  mountDashboard(app);
+  const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+  const base = 'http://127.0.0.1:' + server.address().port;
+  try {
+    check('the conversation is not served without the key',
+      (await get(base + '/dashboard/history?wa_id=' + G)).status === 403);
+
+    const h = JSON.parse((await get(base + '/dashboard/history?key=test-dashboard-key&wa_id=' + G)).body.toString());
+    const withFile = h.messages.filter((m) => m.attachment);
+    check('the conversation lists each attachment with type, name and size',
+      withFile.length === 4 && withFile.every((m) => m.attachment.id && m.attachment.mime && typeof m.attachment.size === 'number'),
+      `${withFile.length} with files`);
+    const pdf = withFile.find((m) => m.attachment.mime === 'application/pdf');
+    check('the PDF keeps its file name', pdf?.attachment?.filename === 'our-rates.pdf');
+
+    const file = await get(base + '/dashboard/attachment/' + pdf.attachment.id + '?key=test-dashboard-key');
+    check('the file itself is served with its type and name',
+      file.status === 200 && String(file.headers['content-type']).startsWith('application/pdf')
+      && /our-rates\.pdf/.test(String(file.headers['content-disposition'])) && file.body.length > 0,
+      `${file.status} ${file.headers['content-type']}`);
+    check('and is not served without the key',
+      (await get(base + '/dashboard/attachment/' + pdf.attachment.id)).status === 403);
+    check('an unknown attachment is a clean 404',
+      (await get(base + '/dashboard/attachment/999999?key=test-dashboard-key')).status === 404);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+
+  globalThis.fetch = prevFetch;
+  cfg.dashboardKey = '';
+  cfg.stt.openaiKey = 'sk-test-whisper';
 }
 
 console.log(`\n═══════════════════════════════════`);

@@ -304,9 +304,20 @@ const RULES = [
 
 /* ═══════════════════════ MENUS ═══════════════════════ */
 
-export async function sendMenuWelcome(contact) {
+/**
+ * The line that completes a guest's details. Their number and country came
+ * with the scan; the email address is the one thing WhatsApp never gives us,
+ * so the welcome asks for it in the same breath.
+ */
+const EMAIL_ASK =
+  `📧 One more thing: reply with your *email address* so we can save your details ` +
+  `and send you the full Vallé overview. We already have your WhatsApp number and ` +
+  `country, so your email is all that is missing.`;
+
+export async function sendMenuWelcome(contact, { askEmail = false } = {}) {
+  const ask = askEmail ? `\n\n${EMAIL_ASK}` : '';
   try {
-    await sendWelcomeList(contact);
+    await sendWelcomeList(contact, ask);
   } catch (err) {
     // A guest who just scanned our QR code must NEVER be met with silence:
     // if the interactive menu is refused, greet them in plain text instead.
@@ -317,12 +328,12 @@ export async function sendMenuWelcome(contact) {
       `23 Coloured Earth, in the south of Mauritius. Open daily 09:00–17:30.\n\n` +
       `Ask me anything, by text or *voice note* 🎙, in your own language: prices, ` +
       `activities, menus, location and map, photos, PDF brochures, bookings and more. Or reply:\n` +
-      `*ACTIVITIES* · *PACKAGES* · *PHOTOS* · *BROCHURE* · *BOOK* · *AGENT* for a person`);
+      `*ACTIVITIES* · *PACKAGES* · *PHOTOS* · *BROCHURE* · *BOOK* · *AGENT* for a person` + ask);
     await log(contact, '[menu] welcome (text fallback)');
   }
 }
 
-async function sendWelcomeList(contact) {
+async function sendWelcomeList(contact, ask = '') {
   const name = contact.profile_name ? `, ${contact.profile_name.split(' ')[0]}` : '';
   const opener = contact.source === 'atm-dubai-2026'
     ? `A pleasure to meet you at *ATM Dubai 2026*${name}. I am the Vallé Advenature assistant. 🌿\n\n`
@@ -335,7 +346,7 @@ async function sendWelcomeList(contact) {
       `23 Coloured Earth, in the south of Mauritius. Open daily 09:00–17:30.\n\n` +
       `Ask me anything, by text or *voice note* 🎙, in your own language: prices, ` +
       `activities, restaurant menus, location and map, photos, PDF brochures, ` +
-      `bookings and more. Or choose from the menu below.`,
+      `bookings and more. Or choose from the menu below.` + ask,
     footer: 'Vallé · Chamouny · Mauritius',
     buttonText: 'Menu',
     sections: [

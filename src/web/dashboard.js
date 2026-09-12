@@ -4,6 +4,7 @@
  *   GET  /dashboard?key=<DASHBOARD_KEY>   the app (HTML shell, data via JSON)
  *   GET  /dashboard/data?key=             stats, series, contacts, leads, feed
  *   GET  /dashboard/history?key=&wa_id=   one guest's conversation
+ *   GET  /dashboard/attachment/:id?key=   a photo, voice note or file as sent
  *   POST /dashboard/email?key=            { wa_id, email? } send the overview
  *   POST /dashboard/email-all?key=        overview to every QR guest with a
  *                                         captured address not yet emailed
@@ -65,6 +66,12 @@ const countryOf = (waId) => {
 
 /** A YYYY-MM-DD string or null; anything else is rejected, never interpolated. */
 const dayParam = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? v : null);
+
+/** Fold the joined attachment columns into one object, or null when there is no file. */
+const withAttachment = ({ att_id, att_mime, att_name, att_size, ...m }) => ({
+  ...m,
+  attachment: att_id ? { id: att_id, mime: att_mime, filename: att_name, size: att_size } : null,
+});
 
 export function mountDashboard(app) {
   app.get('/dashboard/chart.js', (_req, res) => {
@@ -154,8 +161,10 @@ export function mountDashboard(app) {
         q(`SELECT wa_id, profile_name, email, email_at, sms_at, source, mode, bot_silent,
                   created_at, last_seen_at
              FROM contacts ORDER BY last_seen_at DESC LIMIT 500`),
-        q(`SELECT m.created_at, m.direction, m.author, m.body, c.profile_name, c.wa_id
+        q(`SELECT m.created_at, m.direction, m.author, m.body, c.profile_name, c.wa_id,
+                  a.id AS att_id, a.mime AS att_mime, a.filename AS att_name, a.size AS att_size
              FROM messages m JOIN contacts c ON c.id = m.contact_id
+             LEFT JOIN attachments a ON a.message_id = m.id
             ORDER BY m.created_at DESC LIMIT 50`),
       ]);
       res.json({
@@ -176,7 +185,7 @@ export function mountDashboard(app) {
         waiting: waiting.rows,
         leads: leads.rows,
         contacts: contacts.rows.map((c) => ({ ...c, country: countryOf(c.wa_id) })),
-        messages: messages.rows,
+        messages: messages.rows.map(withAttachment),
       });
     } catch (err) {
       console.error('[dashboard] data', err);
@@ -332,17 +341,42 @@ export function mountDashboard(app) {
       const contact = await db.getContactByWaId(String(req.query.wa_id || ''));
       if (!contact) return res.status(404).json({ error: 'no such guest' });
       const { rows } = await q(
-        `SELECT created_at, direction, author, body, msg_type FROM messages
-          WHERE contact_id = $1 ORDER BY created_at DESC LIMIT 200`,
+        `SELECT m.created_at, m.direction, m.author, m.body, m.msg_type,
+                a.id AS att_id, a.mime AS att_mime, a.filename AS att_name, a.size AS att_size
+           FROM messages m LEFT JOIN attachments a ON a.message_id = m.id
+          WHERE m.contact_id = $1 ORDER BY m.created_at DESC LIMIT 200`,
         [contact.id]
       );
       res.json({ contact: {
         wa_id: contact.wa_id, profile_name: contact.profile_name, email: contact.email,
         source: contact.source, mode: contact.mode, bot_silent: contact.bot_silent,
-      }, messages: rows.reverse() });
+      }, messages: rows.reverse().map(withAttachment) });
     } catch (err) {
       console.error('[dashboard] history', err);
       res.status(500).json({ error: 'query failed' });
+    }
+  });
+
+  // A photo, voice note, PDF or video exactly as it was sent, for the
+  // conversation viewer. Same key as everything else on the dashboard.
+  app.get('/dashboard/attachment/:id', async (req, res) => {
+    if (!authed(req)) return res.sendStatus(403);
+    if (!/^\d+$/.test(String(req.params.id))) return res.sendStatus(404);
+    try {
+      const a = await db.getAttachment(req.params.id);
+      if (!a) return res.sendStatus(404);
+      const name = String(a.filename || `attachment-${a.id}`).replace(/["\r\n]/g, '');
+      res.set({
+        'Content-Type': a.mime,
+        'Content-Length': String(a.bytes.length),
+        'Content-Disposition': `inline; filename="${name.replace(/[^\x20-\x7e]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name)}`,
+        'Cache-Control': 'private, max-age=86400',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      res.end(a.bytes);
+    } catch (err) {
+      console.error('[dashboard] attachment', err);
+      res.sendStatus(500);
     }
   });
 
@@ -548,6 +582,13 @@ const PAGE = `<!doctype html>
   .bubble.in{background:#fff;border:1px solid var(--line);align-self:flex-start;border-bottom-left-radius:4px}
   .bubble.out{background:var(--lavender);align-self:flex-end;border-bottom-right-radius:4px}
   .bubble .who{font-size:10.5px;color:var(--dim);margin-bottom:2px}
+  .bubble .att{display:block;margin-top:6px}
+  .bubble .att img{max-width:260px;max-height:260px;border-radius:10px;display:block}
+  .bubble .att audio,.bubble .att video{display:block;max-width:100%;margin-bottom:2px}
+  .bubble .att video{max-width:280px;border-radius:10px}
+  .bubble .att a{font-size:11.5px;color:var(--dim)}
+  .bubble .att a.file{font-size:13px;color:inherit;text-decoration:underline}
+  .attlink{font-size:11px;color:var(--dim);white-space:nowrap}
   .modal footer{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:#fff}
   .modal footer input{flex:1;min-width:170px;padding:8px 12px;border:1px solid var(--line);border-radius:10px;font:inherit}
 
@@ -636,6 +677,21 @@ const PAGE = `<!doctype html>
 const KEY = new URLSearchParams(location.search).get('key');
 const api = (p) => p + (p.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(KEY);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+/* A photo, voice note, video or file exactly as it was sent: images in place,
+   audio and video in the browser's own player, anything else as a link. Each
+   one also opens in a new tab, for a browser that cannot play an .ogg note. */
+const attUrl = (a) => api('/dashboard/attachment/' + a.id);
+const fmtSize = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? Math.round(n / 1024) + ' KB' : n + ' B';
+function attachmentHtml(a) {
+  if (!a) return '';
+  const u = attUrl(a), name = esc(a.filename || a.mime), size = fmtSize(a.size || 0);
+  const open = '<a href="' + u + '" target="_blank" rel="noopener">open · ' + size + '</a>';
+  if (a.mime.startsWith('image/')) return '<a class="att" href="' + u + '" target="_blank" rel="noopener"><img src="' + u + '" alt="' + name + '" loading="lazy"></a>';
+  if (a.mime.startsWith('audio/')) return '<div class="att"><audio controls preload="none" src="' + u + '"></audio>' + open + '</div>';
+  if (a.mime.startsWith('video/')) return '<div class="att"><video controls preload="metadata" src="' + u + '"></video>' + open + '</div>';
+  return '<div class="att"><a class="file" href="' + u + '" target="_blank" rel="noopener">' + name + ' · ' + size + '</a></div>';
+}
+const attachmentLink = (a) => a ? ' <a class="attlink" href="' + attUrl(a) + '" target="_blank" rel="noopener">open</a>' : '';
 const when = (d) => d ? new Intl.DateTimeFormat('en-GB',{timeZone:'${TZ}',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}).format(new Date(d)) : '';
 const dayOf = (d) => d ? new Date(d).toLocaleDateString('en-CA', { timeZone: '${TZ}' }) : '';
 const timeOf = (d) => d ? new Date(d).toLocaleTimeString('en-GB', { timeZone: '${TZ}', hour12: false }) : '';
@@ -883,7 +939,7 @@ function renderFeed() {
     <thead><tr><th>When</th><th>Guest</th><th></th><th>From</th><th>Message</th></tr></thead><tbody>\${
     m.map((x) => \`<tr><td class="num">\${when(x.created_at)}</td><td>\${esc(x.profile_name || x.wa_id)}</td>
       <td style="color:\${x.direction === 'in' ? C.indigo : '#1E8A4C'};font-weight:600;font-size:11px;letter-spacing:.06em">\${x.direction === 'in' ? 'IN' : 'OUT'}</td>
-      <td>\${esc(x.author)}</td><td class="msg">\${esc(x.body || '')}</td></tr>\`).join('')
+      <td>\${esc(x.author)}</td><td class="msg">\${esc(x.body || '')}\${attachmentLink(x.attachment)}</td></tr>\`).join('')
     }</tbody></table>\` : '<div class="empty">No messages yet.</div>';
 }
 
@@ -900,7 +956,7 @@ async function openModal(waId) {
   document.getElementById('mEmail').value = h.contact.email || '';
   document.getElementById('mChat').innerHTML = h.messages.map((m) => \`
     <div class="bubble \${m.direction === 'in' ? 'in' : 'out'}">
-      <div class="who">\${esc(m.author)} · \${when(m.created_at)}</div>\${esc(m.body || '[' + (m.msg_type || 'media') + ']')}</div>\`).join('')
+      <div class="who">\${esc(m.author)} · \${when(m.created_at)}</div>\${esc(m.body || '[' + (m.msg_type || 'media') + ']')}\${attachmentHtml(m.attachment)}</div>\`).join('')
     || '<div class="empty">No messages stored.</div>';
   document.getElementById('overlay').classList.add('open');
   const chat = document.getElementById('mChat'); chat.scrollTop = chat.scrollHeight;

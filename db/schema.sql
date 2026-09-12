@@ -56,6 +56,21 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id, created_at DESC);
 
+-- The file behind a message: a guest's photo, voice note, PDF or video, or one
+-- the team sent from the WhatsApp Business app. Kept inline so the dashboard
+-- can show it: the Railway container has no disk that survives a deploy, the
+-- database does. Files above the router's cap are described, not stored.
+CREATE TABLE IF NOT EXISTS attachments (
+  id            BIGSERIAL PRIMARY KEY,
+  message_id    BIGINT UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+  wa_media_id   TEXT,                            -- WhatsApp's media id, for tracing
+  mime          TEXT NOT NULL,                   -- image/jpeg, audio/ogg, application/pdf…
+  filename      TEXT,                            -- documents carry one, photos do not
+  size          INT NOT NULL,
+  bytes         BYTEA NOT NULL,
+  created_at    TIMESTAMPTZ DEFAULT now()
+);
+
 -- Staff who can drive the back office from their own WhatsApp
 CREATE TABLE IF NOT EXISTS agents (
   id            BIGSERIAL PRIMARY KEY,

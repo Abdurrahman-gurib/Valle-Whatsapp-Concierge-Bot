@@ -192,7 +192,12 @@ export async function listStaleHumanChats(minutes) {
  * Returns false if this Meta message id was already stored (duplicate webhook).
  * Uses RETURNING rather than rowCount — unambiguous across drivers.
  */
-export async function logMessage({
+/**
+ * Store a message. Resolves to the new row's id, or null when WhatsApp
+ * re-delivered a message we already have (the unique index on the WhatsApp id
+ * keeps exactly one copy).
+ */
+export async function logMessageId({
   contactId, waMessageId, direction, author, authorWaId, body, msgType = 'text',
 }) {
   const { rows } = await q(
@@ -202,7 +207,36 @@ export async function logMessage({
      RETURNING id`,
     [contactId, waMessageId || null, direction, author, authorWaId || null, body, msgType]
   );
-  return rows.length > 0;
+  return rows[0]?.id ?? null;
+}
+
+/** Store a message; true when it is new, false when it was a re-delivery. */
+export async function logMessage(message) {
+  return (await logMessageId(message)) !== null;
+}
+
+/* ─────────────── ATTACHMENTS ─────────────── */
+
+/**
+ * The file behind a message: a guest's photo, voice note, PDF or video, or one
+ * the team sent from the app. Kept in the database so the dashboard can show
+ * it; the Railway container has no disk that survives a deploy.
+ */
+export async function saveAttachment({ messageId, waMediaId, mime, filename, size, bytes }) {
+  await q(
+    `INSERT INTO attachments (message_id, wa_media_id, mime, filename, size, bytes)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT (message_id) DO NOTHING`,
+    [messageId, waMediaId || null, mime, filename || null, size, bytes]
+  );
+}
+
+export async function getAttachment(id) {
+  const { rows } = await q(
+    `SELECT id, message_id, mime, filename, size, bytes FROM attachments WHERE id = $1`,
+    [id]
+  );
+  return rows[0] || null;
 }
 
 /**
