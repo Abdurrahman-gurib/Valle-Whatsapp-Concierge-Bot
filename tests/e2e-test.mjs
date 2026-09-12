@@ -1624,14 +1624,17 @@ console.log('\n32. A scan also texts their phone; the overview goes out by email
   cfg.bot.mode = 'hybrid';
   // Pretend both providers are configured. No request leaves the process:
   // every call below is answered by the stub.
+  // skipCountries 'none': the guests in this section carry UAE numbers, which
+  // the built-in list would skip; the list itself is tested further down.
   cfg.sms = { accountSid: 'ACtest', authToken: 'tok', from: '+15550001111',
-    messagingServiceSid: '', enabled: true };
+    messagingServiceSid: '', alphaSender: '', skipCountries: 'none', enabled: true };
+  cfg.publicUrl = 'https://bot.example.test';
   cfg.email = { apiKey: 're_test', from: 'Vallé <hello@valle.mu>',
     replyTo: 'reservations@valle.mu', cc: 'sales@valle.mu',
     bcc: 'abdurrahman@valle.mu, ashfaaq@valle.mu' };
 
   const { handleIncomingMessage } = await import('../src/bot/router.js');
-  const { segments, toE164 } = await import('../src/notify/sms.js');
+  const { segments, toE164, senderFor } = await import('../src/notify/sms.js');
   const { findEmail } = await import('../src/notify/email.js');
 
   const out = [], sms = [], mails = [];
@@ -1697,6 +1700,13 @@ console.log('\n32. A scan also texts their phone; the overview goes out by email
     /Vallé Advenature Park/.test(sms[0]?.Body || '') && /ATM Dubai 2026/.test(sms[0]?.Body || ''));
   check('it fits in a single SMS segment, so it costs one message',
     segments(sms[0]?.Body || '') === 1, `${segments(sms[0]?.Body || '')} segments`);
+  check('it points the guest to the website', /vallepark\.com/.test(sms[0]?.Body || ''));
+  check('Twilio is asked to report delivery back to the bot',
+    sms[0]?.StatusCallback === 'https://bot.example.test/twilio/status', sms[0]?.StatusCallback);
+  check('segment maths: 160 plain characters are one SMS', segments('a'.repeat(160)) === 1);
+  check('161 plain characters are two', segments('a'.repeat(161)) === 2);
+  check('a euro sign costs two, so 159 letters plus € spill over', segments('a'.repeat(159) + '€') === 2);
+  check('one emoji makes the whole text UCS-2: 70 letters plus 🌿 are two', segments('a'.repeat(70) + '🌿') === 2);
 
   const c1 = await dbMod.getContactByWaId(G);
   check('the send is recorded on the contact', c1.sms_at !== null);
@@ -1707,6 +1717,114 @@ console.log('\n32. A scan also texts their phone; the overview goes out by email
   check('later messages never trigger another SMS', sms.length === before, `sent ${sms.length - before}`);
   check('ignoring the email question costs nothing: the next question is answered normally',
     hours.some((m) => /09:00/.test(m.text?.body || '')) && (await dbMod.getContactByWaId(G)).awaiting === null);
+
+  // A second scan of the same QR does not text them again either.
+  await say(ATM);
+  await new Promise((r) => setImmediate(r));
+  check('a second scan does not text again', sms.length === before, `sent ${sms.length - before}`);
+  check("the welcome is recorded in the conversation with Twilio's message id",
+    (await dbMod.q(`SELECT m.body FROM messages m JOIN contacts c ON c.id = m.contact_id
+                     WHERE c.wa_id = $1 AND m.body LIKE '[sms: welcome%'`, [G])).rows.length === 1);
+
+  // Twilio refuses (the guest once replied STOP): WhatsApp still answers, the reason is recorded.
+  const refusing = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).includes('api.twilio.com')) {
+      return new Response(JSON.stringify({ code: 21610, message: 'Attempt to send to unsubscribed recipient', status: 400 }),
+        { status: 400, headers: { 'content-type': 'application/json' } });
+    }
+    return refusing(url, opts);
+  };
+  const G5 = '971509876544';
+  const refused = out.length;
+  await handleIncomingMessage(inbound(G5, ATM), { wa_id: G5, profile: { name: 'Lina' } });
+  await new Promise((r) => setTimeout(r, 20));
+  const c5 = await dbMod.getContactByWaId(G5);
+  const c5lines = (await dbMod.q(`SELECT body FROM messages WHERE contact_id = $1 AND body LIKE '[sms:%'`, [c5.id])).rows.map((r) => r.body);
+  check('Twilio refusing the text never costs the WhatsApp welcome',
+    out.slice(refused).some((m) => m.interactive?.type === 'list'));
+  check('the refusal is recorded with its code and meaning, and sms_at stays empty',
+    c5.sms_at === null && c5lines.some((b) => /^\[sms: failed 21610 — the guest replied STOP/.test(b)), JSON.stringify(c5lines));
+  globalThis.fetch = refusing;
+
+  // Twilio hanging: the WhatsApp welcome still arrives at once.
+  const hanging = globalThis.fetch;
+  globalThis.fetch = (url, opts) => (String(url).includes('api.twilio.com') ? new Promise(() => {}) : hanging(url, opts));
+  const G6 = '971509876545';
+  const hung = out.length;
+  await handleIncomingMessage(inbound(G6, ATM), { wa_id: G6, profile: { name: 'Omar' } });
+  check('a hanging Twilio never delays the WhatsApp welcome', out.slice(hung).some((m) => m.interactive?.type === 'list'));
+  globalThis.fetch = hanging;
+
+  // A Messaging Service is used when configured, with Basic auth for the account.
+  let authHeader = '';
+  const viaService = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).includes('api.twilio.com')) authHeader = opts.headers.Authorization;
+    return viaService(url, opts);
+  };
+  cfg.sms = { accountSid: 'ACtest', authToken: 'tok', from: '', messagingServiceSid: 'MGtest', alphaSender: '', skipCountries: 'none', enabled: true };
+  const G7 = '971509876546';
+  await handleIncomingMessage(inbound(G7, ATM), { wa_id: G7, profile: { name: 'Sara' } });
+  await new Promise((r) => setImmediate(r));
+  const last = sms[sms.length - 1];
+  check('with a Messaging Service the send names it and no From number',
+    last?.MessagingServiceSid === 'MGtest' && !('From' in (last || {})), JSON.stringify(last));
+  check('the request carries Basic auth for the account',
+    authHeader === 'Basic ' + Buffer.from('ACtest:tok').toString('base64'));
+  globalThis.fetch = viaService;
+
+  // SMS_ENABLED=false is an off switch that leaves the credentials in place.
+  cfg.sms.enabled = false;
+  const G8 = '971509876547';
+  const off = sms.length;
+  await handleIncomingMessage(inbound(G8, ATM), { wa_id: G8, profile: { name: 'Ali' } });
+  await new Promise((r) => setImmediate(r));
+  check('SMS_ENABLED=false sends nothing', sms.length === off);
+  check('segment maths: 71 trademark signs are two UCS-2 SMS, 307 letters are three',
+    segments('™'.repeat(71)) === 2 && segments('a'.repeat(307)) === 3);
+
+  /* ---- who sends, per country ---- */
+  cfg.sms = { accountSid: 'ACtest', authToken: 'tok', from: '+15550001111', messagingServiceSid: '',
+    alphaSender: 'Valle', skipCountries: '', enabled: true };
+  check('a Mauritian number sees the park\'s name as the sender', senderFor('23052928841').from === 'Valle');
+  check('a British number too', senderFor('447700900123').from === 'Valle');
+  check('a French number sees the Twilio number instead', senderFor('33612345678').from === '+15550001111');
+  check('an Indian number too', senderFor('919876543210').from === '+15550001111');
+  check('a UAE number is skipped, with the reason', /registered weeks in advance/.test(senderFor('971501234567').skip || ''));
+  check('Saudi, Qatar, Russia, Turkey and the USA are skipped too',
+    ['966501234567', '97433123456', '79161234567', '905321234567', '12125551234'].every((n) => senderFor(n).skip));
+  cfg.sms.skipCountries = '7,90';
+  check('SMS_SKIP_COUNTRIES replaces the list: the UAE is texted once its sender ID is registered',
+    senderFor('971501234567').from === '+15550001111' && senderFor('79161234567').skip);
+  cfg.sms.skipCountries = '';
+  cfg.sms.messagingServiceSid = 'MGtest';
+  check('a Messaging Service, when set, decides the sender itself', senderFor('23052928841').messagingServiceSid === 'MGtest');
+  check('but the skip list still applies', senderFor('971501234567').skip);
+  cfg.sms.messagingServiceSid = '';
+  cfg.sms.from = '';
+  check('an alphanumeric sender alone cannot text France, and says what to set',
+    /set TWILIO_FROM/.test(senderFor('33612345678').none || '') && senderFor('23052928841').from === 'Valle');
+  cfg.sms.from = '+15550001111';
+
+  // A UAE guest scanning today: WhatsApp answers, no Twilio call, the dashboard learns why.
+  const G9 = '971509876548';
+  const skippedAt = sms.length, welcomeAt = out.length;
+  await handleIncomingMessage(inbound(G9, ATM), { wa_id: G9, profile: { name: 'Hamad' } });
+  await new Promise((r) => setTimeout(r, 20));
+  const c9 = await dbMod.getContactByWaId(G9);
+  const c9lines = (await dbMod.q(`SELECT body FROM messages WHERE contact_id = $1 AND body LIKE '[sms:%'`, [c9.id])).rows.map((r) => r.body);
+  check('a UAE scan gets the WhatsApp welcome and no Twilio call',
+    sms.length === skippedAt && out.slice(welcomeAt).some((m) => m.interactive?.type === 'list'));
+  check('and the conversation records why the text was skipped',
+    c9.sms_at === null && c9lines.some((b) => /^\[sms: skipped — UAE operators/.test(b)), JSON.stringify(c9lines));
+
+  // A Mauritian guest: texted from "Valle".
+  const G10 = '23059876543';
+  await handleIncomingMessage(inbound(G10, ATM), { wa_id: G10, profile: { name: 'Marie' } });
+  await new Promise((r) => setImmediate(r));
+  check('a Mauritian scan is texted from "Valle"', sms[sms.length - 1]?.To === '+23059876543' && sms[sms.length - 1]?.From === 'Valle', JSON.stringify(sms[sms.length - 1]));
+  cfg.sms = { accountSid: 'ACtest', authToken: 'tok', from: '+15550001111', messagingServiceSid: '', alphaSender: '', skipCountries: 'none', enabled: true };
 
   /* ---- asking for the address ---- */
   const asked = await say('Can you email it to me?');
@@ -1814,7 +1932,7 @@ console.log('\n32. A scan also texts their phone; the overview goes out by email
   check('a WhatsApp id becomes E.164', toE164('971501234567') === '+971501234567');
 
   /* ---- with no credentials, neither channel does anything ---- */
-  cfg.sms = { accountSid: '', authToken: '', from: '', messagingServiceSid: '', enabled: true };
+  cfg.sms = { accountSid: '', authToken: '', from: '', messagingServiceSid: '', alphaSender: '', skipCountries: '', enabled: true };
   cfg.email = { apiKey: '', from: '', replyTo: '', bcc: '' };
   const smsBefore = sms.length, mailBefore2 = mails.length;
   const G4 = '447700900123';
@@ -2140,6 +2258,65 @@ console.log('\n34. Attachments: described in words, kept in the database, served
   globalThis.fetch = prevFetch;
   cfg.dashboardKey = '';
   cfg.stt.openaiKey = 'sk-test-whisper';
+}
+
+/* ═══ 35. Twilio reports delivery back, and it lands in the conversation ═══ */
+console.log('\n35. SMS delivery reports: signed by Twilio, written to the guest\'s conversation');
+{
+  const { config: cfg } = await import('../src/core/config.js');
+  const { mountSmsStatusWebhook, verifyTwilioSignature } = await import('../src/notify/sms.js');
+  const crypto = (await import('node:crypto')).default;
+  const express = (await import('express')).default;
+  const http = (await import('node:http')).default;
+  cfg.sms = { accountSid: 'ACtest', authToken: 'tok-secret', from: '+15550001111', messagingServiceSid: '', enabled: true };
+  cfg.publicUrl = 'https://bot.example.test';
+  const URL_ = 'https://bot.example.test/twilio/status';
+  // Twilio's recipe: url + every field's name and value in name order, HMAC-SHA1, base64.
+  const sign = (params) => crypto.createHmac('sha1', 'tok-secret')
+    .update(URL_ + Object.keys(params).sort().map((k) => k + params[k]).join('')).digest('base64');
+
+  const G = '971509876543';   // texted in section 32
+  const good = { MessageSid: 'SM1', MessageStatus: 'delivered', To: '+' + G, From: '+15550001111' };
+  check('a genuine Twilio signature is accepted', verifyTwilioSignature(URL_, good, sign(good)) === true);
+  check('a forged one is refused', verifyTwilioSignature(URL_, good, sign({ ...good, MessageStatus: 'failed' })) === false);
+  check('a missing one is refused', verifyTwilioSignature(URL_, good, undefined) === false);
+
+  const app = express();
+  mountSmsStatusWebhook(app);
+  const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+  const post = (params, signature) => new Promise((resolve, reject) => {
+    const body = new URLSearchParams(params).toString();
+    const req = http.request({
+      host: '127.0.0.1', port: server.address().port, path: '/twilio/status', method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body),
+        ...(signature ? { 'X-Twilio-Signature': signature } : {}) },
+    }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    req.on('error', reject);
+    req.end(body);
+  });
+  const lines = async () => (await dbMod.q(
+    `SELECT m.body FROM messages m JOIN contacts c ON c.id = m.contact_id
+      WHERE c.wa_id = $1 AND m.body LIKE '[sms:%' ORDER BY m.id ASC`, [G])).rows.map((r) => r.body);
+  try {
+    check('an unsigned report is rejected with 403', (await post(good)) === 403);
+    check('a report signed for different content is rejected', (await post(good, sign({ ...good, To: '+10000000000' }))) === 403);
+    check('a genuine delivery report is accepted', (await post(good, sign(good))) === 204);
+    check('and "[sms: delivered]" is written to the guest\'s conversation', (await lines()).includes('[sms: delivered]'));
+    const sent = { MessageSid: 'SM1', MessageStatus: 'sent', To: '+' + G, From: '+15550001111' };
+    const before = (await lines()).length;
+    check('the in-between "sent" status is accepted but not written',
+      (await post(sent, sign(sent))) === 204 && (await lines()).length === before);
+    const failed = { MessageSid: 'SM2', MessageStatus: 'undelivered', ErrorCode: '30003', To: '+' + G, From: '+15550001111' };
+    await post(failed, sign(failed));
+    check('a failure is written with the code and what it means',
+      (await lines()).some((b) => /^\[sms: undelivered 30003 — the phone is off/.test(b)), JSON.stringify(await lines()));
+    const unknown = { MessageSid: 'SM3', MessageStatus: 'delivered', To: '+19990000000', From: '+15550001111' };
+    check('a report for a number we never texted is accepted and ignored', (await post(unknown, sign(unknown))) === 204);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+  cfg.publicUrl = '';
+  cfg.sms = { accountSid: '', authToken: '', from: '', messagingServiceSid: '', enabled: true };
 }
 
 console.log(`\n═══════════════════════════════════`);

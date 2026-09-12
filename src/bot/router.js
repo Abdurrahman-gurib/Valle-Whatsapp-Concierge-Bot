@@ -4,7 +4,7 @@ import { generateReply } from './ai.js';
 import { handleAdminMessage } from './admin.js';
 import { handleMenuMessage, sendMenuWelcome } from './menu-bot.js';
 import { wantsHuman, needsHuman } from './handover-signals.js';
-import { sendSms, smsEnabled } from '../notify/sms.js';
+import { sendSms, smsEnabled, WELCOME_SMS } from '../notify/sms.js';
 import { sendOverviewEmail, emailEnabled, findEmail } from '../notify/email.js';
 import { sendGallery, hasImages } from './images.js';
 import { sendDoc } from './documents.js';
@@ -41,17 +41,6 @@ const APP_AGENT = 'app';
 /* ═══════════════ THE SECOND AND THIRD CHANNELS ═══════════════ */
 
 /**
- * The welcome text message.
- *
- * Plain Latin on purpose: one character outside the GSM alphabet (a ™, an
- * emoji) turns a 160 character SMS into a 70 character one and triples what
- * every scan costs. This fits in a single segment.
- */
-const WELCOME_SMS =
-  'Vallé Advenature Park: thanks for scanning our QR at ATM Dubai 2026. '
-  + 'We have replied on WhatsApp with everything about the park. See you in Mauritius!';
-
-/**
  * A guest who has just scanned gets the same welcome on their phone, once.
  *
  * Fire and forget, deliberately: Twilio is slower than WhatsApp and far less
@@ -61,12 +50,25 @@ const WELCOME_SMS =
 function welcomeBySms(contact) {
   if (!smsEnabled() || !config.sms.enabled || contact.sms_at) return;
   sendSms(contact.wa_id, WELCOME_SMS)
-    .then(async (ok) => {
-      if (!ok) return;
-      await db.markSmsSent(contact.wa_id);
-      await db.logMessage({
-        contactId: contact.id, direction: 'out', author: 'system', body: '[sms: welcome]',
-      });
+    .then(async (r) => {
+      if (r.ok) {
+        await db.markSmsSent(contact.wa_id);
+        await db.logMessage({
+          contactId: contact.id, direction: 'out', author: 'system', body: `[sms: welcome ${r.sid}]`,
+        });
+      } else if (r.code === 'skipped') {
+        // A country a text cannot reach today (see senderFor): say so, once.
+        await db.logMessage({
+          contactId: contact.id, direction: 'out', author: 'system', body: `[sms: skipped — ${r.hint}]`,
+        });
+      } else if (r.code !== 'disabled') {
+        // The reason lands in the conversation, so the dashboard shows why a
+        // guest has no text: a country not enabled, a STOP, a bad number.
+        await db.logMessage({
+          contactId: contact.id, direction: 'out', author: 'system',
+          body: `[sms: failed ${r.code}${r.hint ? ' — ' + r.hint : ''}]`,
+        });
+      }
     })
     .catch((err) => console.error('[router] welcome SMS failed', err.message));
 }

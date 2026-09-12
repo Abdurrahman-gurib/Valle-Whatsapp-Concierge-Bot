@@ -3,6 +3,7 @@ import { config } from './core/config.js';
 import { verifySignature } from './whatsapp/client.js';
 import { handleIncomingMessage, handleStaffEcho, sweepStaleHandovers } from './bot/router.js';
 import { mountDashboard } from './web/dashboard.js';
+import { mountSmsStatusWebhook } from './notify/sms.js';
 import { pool } from './core/db.js';
 
 // Timestamp every log line. On 31 Aug a guest's questions went unanswered and
@@ -124,6 +125,9 @@ app.get('/', (_req, res) => res.send('Vallé WhatsApp bot is running 🌿'));
 
 /* ───────── read-only web dashboard (see dashboard.js) ───────── */
 mountDashboard(app);
+
+/* ───────── Twilio delivery reports for the welcome SMS (see notify/sms.js) ───────── */
+mountSmsStatusWebhook(app);
 
 const server = app.listen(config.port, () => {
   console.log(`🌿 Vallé WhatsApp bot listening on :${config.port} (${config.env})`);

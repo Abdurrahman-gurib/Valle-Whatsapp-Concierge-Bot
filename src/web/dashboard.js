@@ -67,6 +67,16 @@ const countryOf = (waId) => {
 /** A YYYY-MM-DD string or null; anything else is rejected, never interpolated. */
 const dayParam = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? v : null);
 
+/** The welcome SMS as Twilio last reported it: '', 'sent', 'delivered' or 'failed'. */
+const smsStateOf = (c) => {
+  if (!c.sms_at && !c.sms_status) return '';
+  const s = String(c.sms_status || '');
+  if (s.startsWith('[sms: delivered')) return 'delivered';
+  if (s.startsWith('[sms: failed') || s.startsWith('[sms: undelivered')) return 'failed';
+  if (s.startsWith('[sms: skipped')) return 'skipped';
+  return 'sent';
+};
+
 /** Fold the joined attachment columns into one object, or null when there is no file. */
 const withAttachment = ({ att_id, att_mime, att_name, att_size, ...m }) => ({
   ...m,
@@ -107,7 +117,9 @@ export function mountDashboard(app) {
              (SELECT count(*) FROM messages WHERE created_at > now() - interval '24 hours')         AS msgs_24h,
              (SELECT count(*) FROM leads)                                                           AS leads_total,
              (SELECT count(*) FROM contacts WHERE email IS NOT NULL)                                AS emails_captured,
-             (SELECT count(*) FROM contacts WHERE email_at IS NOT NULL)                             AS emails_sent`),
+             (SELECT count(*) FROM contacts WHERE email_at IS NOT NULL)                             AS emails_sent,
+             (SELECT count(*) FROM contacts WHERE sms_at IS NOT NULL)                               AS sms_sent,
+             (SELECT count(DISTINCT contact_id) FROM messages WHERE body = '[sms: delivered]')     AS sms_delivered`),
         q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day, direction, count(*) AS n
              FROM messages WHERE created_at > now() - interval '14 days'
             GROUP BY 1, 2 ORDER BY 1`, [TZ]),
@@ -158,9 +170,11 @@ export function mountDashboard(app) {
         q(`SELECT l.created_at, l.full_name, l.pax, l.visit_date, l.interest, c.profile_name, c.wa_id
              FROM leads l JOIN contacts c ON c.id = l.contact_id
             ORDER BY l.created_at DESC LIMIT 100`),
-        q(`SELECT wa_id, profile_name, email, email_at, sms_at, source, mode, bot_silent,
-                  created_at, last_seen_at
-             FROM contacts ORDER BY last_seen_at DESC LIMIT 500`),
+        q(`SELECT c.wa_id, c.profile_name, c.email, c.email_at, c.sms_at, c.source, c.mode, c.bot_silent,
+                  c.created_at, c.last_seen_at,
+                  (SELECT m.body FROM messages m WHERE m.contact_id = c.id AND m.body LIKE '[sms:%'
+                    ORDER BY m.created_at DESC LIMIT 1)                                             AS sms_status
+             FROM contacts c ORDER BY c.last_seen_at DESC LIMIT 500`),
         q(`SELECT m.created_at, m.direction, m.author, m.body, c.profile_name, c.wa_id,
                   a.id AS att_id, a.mime AS att_mime, a.filename AS att_name, a.size AS att_size
              FROM messages m JOIN contacts c ON c.id = m.contact_id
@@ -207,11 +221,13 @@ export function mountDashboard(app) {
       const P = [TZ, from, to];
 
       const [guests, daily, hourly, msgDaily] = await Promise.all([
-        q(`SELECT profile_name, wa_id, email, email_at, source, mode, last_seen_at,
-                  to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS scan_date,
-                  to_char(created_at AT TIME ZONE $1, 'HH24:MI:SS') AS scan_time
-             FROM contacts WHERE source IS NOT NULL AND ${RANGE}
-            ORDER BY created_at ASC`, P),
+        q(`SELECT c.profile_name, c.wa_id, c.email, c.email_at, c.sms_at, c.source, c.mode, c.last_seen_at,
+                  to_char(c.created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS scan_date,
+                  to_char(c.created_at AT TIME ZONE $1, 'HH24:MI:SS') AS scan_time,
+                  (SELECT m.body FROM messages m WHERE m.contact_id = c.id AND m.body LIKE '[sms:%'
+                    ORDER BY m.created_at DESC LIMIT 1) AS sms_status
+             FROM contacts c WHERE c.source IS NOT NULL AND ${RANGE}
+            ORDER BY c.created_at ASC`, P),
         q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day, count(*) AS scans
              FROM contacts WHERE source IS NOT NULL AND ${RANGE} GROUP BY 1 ORDER BY 1`, P),
         q(`SELECT to_char(created_at AT TIME ZONE $1, 'HH24') AS hour, count(*) AS n
@@ -255,6 +271,8 @@ export function mountDashboard(app) {
         { k: 'QR scans in range', v: guests.rows.length },
         { k: 'Emails captured in range', v: guests.rows.filter((c) => c.email).length },
         { k: 'Overviews emailed in range', v: guests.rows.filter((c) => c.email_at).length },
+        { k: 'Welcome SMS sent in range', v: guests.rows.filter((c) => c.sms_at).length },
+        { k: 'Welcome SMS delivered in range', v: guests.rows.filter((c) => smsStateOf(c) === 'delivered').length },
         { k: 'Countries in range', v: Object.keys(byCountry).length },
         { k: 'Peak scan hour in range', v: peakN > 0 ? `${peakH}:00 (${peakN} scans)` : 'no scans in range' },
         { k: 'Guest messages in range', v: msgDaily.rows.reduce((x, r) => x + Number(r.from_guests), 0) },
@@ -272,6 +290,7 @@ export function mountDashboard(app) {
         { header: 'Country', key: 'country', width: 16 },
         { header: 'Email', key: 'email', width: 30 },
         { header: 'Overview emailed', key: 'sent', width: 20 },
+        { header: 'SMS', key: 'sms', width: 11 },
         { header: 'Source', key: 'src', width: 15 },
         { header: 'Mode', key: 'mode', width: 9 },
         { header: 'Last seen', key: 'seen', width: 20 },
@@ -279,7 +298,7 @@ export function mountDashboard(app) {
       for (const c of guests.rows) {
         g.addRow({ sd: c.scan_date, st: c.scan_time, name: c.profile_name || '',
           num: c.wa_id, country: countryOf(c.wa_id), email: c.email || '',
-          sent: local(c.email_at), src: c.source, mode: c.mode, seen: local(c.last_seen_at) });
+          sent: local(c.email_at), sms: smsStateOf(c), src: c.source, mode: c.mode, seen: local(c.last_seen_at) });
       }
       head(g);
 
@@ -567,6 +586,7 @@ const PAGE = `<!doctype html>
   .msg{max-width:460px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .empty{padding:16px;color:var(--dim);font-size:13.5px}
   .mail-ok{color:#1E8A4C;font-weight:600;font-size:12px}
+  .sms-bad{color:#B3261E;font-weight:600;font-size:12px;cursor:help}
 
   /* modal */
   .overlay{position:fixed;inset:0;background:rgba(34,19,58,.55);display:none;align-items:center;justify-content:center;padding:16px;z-index:50}
@@ -648,7 +668,7 @@ const PAGE = `<!doctype html>
     <span class="count" id="count"></span>
   </div>
   <div class="card scroll"><table>
-    <thead><tr><th>Guest</th><th>Number</th><th>Country</th><th>Email</th><th>Source</th><th>Mode</th><th>Last seen</th><th></th></tr></thead>
+    <thead><tr><th>Guest</th><th>Number</th><th>Country</th><th>Email</th><th>SMS</th><th>Source</th><th>Mode</th><th>Last seen</th><th></th></tr></thead>
     <tbody id="rows"></tbody>
   </table></div>
 
@@ -735,6 +755,7 @@ function tiles() {
     t(s.total_contacts,'Guests') + t(s.qr_scans,'QR scans','go') + t(s.active_24h,'Active 24 h') +
     t(s.waiting,'Waiting', s.waiting > 0 ? 'warn' : '') + t(s.msgs_24h,'Messages 24 h') +
     t(s.leads_total,'Leads') + t(s.emails_captured,'Emails captured') + t(s.emails_sent,'Overviews sent','go') +
+    t(s.sms_sent,'SMS sent' + (Number(s.sms_delivered) ? ' · ' + s.sms_delivered + ' delivered' : ''),'go') +
     t(peak ? peak + ':00' : '·','Peak scan hour','go') + t(busyLabel,'Busiest day') +
     t(D.avgReply != null ? D.avgReply + ' s' : '·','Avg AI reply time','go') +
     t(D.unanswered.length,'Awaiting reply', D.unanswered.length > 0 ? 'warn' : 'go') +
@@ -907,12 +928,32 @@ function renderRows() {
       <td class="num">\${esc(c.wa_id)}</td>
       <td>\${esc(c.country || '')}</td>
       <td>\${c.email ? esc(c.email) + (c.email_at ? ' <span class="mail-ok">Sent</span>' : '') : '<span class="dim">·</span>'}</td>
+      <td>\${smsCell(c)}</td>
       <td>\${c.source ? pill(c.source, '#14432A') : '<span class="dim">·</span>'}</td>
       <td>\${modePill(c)}</td>
       <td class="num">\${when(c.last_seen_at)}</td>
       <td><button class="btn ghost sm" data-mail="\${esc(c.wa_id)}" \${D.emailEnabled ? '' : 'disabled'}>Email</button></td>
     </tr>\`).join('')
-    : '<tr><td colspan="8" class="empty">No guests match these filters.</td></tr>';
+    : '<tr><td colspan="9" class="empty">No guests match these filters.</td></tr>';
+}
+
+/* The welcome SMS, as Twilio last reported it: sent (accepted, no report yet),
+   delivered, or failed with the reason in the tooltip. */
+function smsState(c) {
+  if (!c.sms_at && !c.sms_status) return '';
+  const s = String(c.sms_status || '');
+  if (s.startsWith('[sms: delivered')) return 'delivered';
+  if (s.startsWith('[sms: failed') || s.startsWith('[sms: undelivered')) return 'failed';
+  if (s.startsWith('[sms: skipped')) return 'skipped';
+  return 'sent';
+}
+function smsCell(c) {
+  const state = smsState(c);
+  if (!state) return '<span class="dim">·</span>';
+  if (state === 'delivered') return '<span class="mail-ok">Delivered</span>';
+  if (state === 'failed') return '<span class="sms-bad" title="' + esc(c.sms_status) + '">Failed</span>';
+  if (state === 'skipped') return '<span class="dim" title="' + esc(c.sms_status) + '" style="cursor:help">Skipped</span>';
+  return 'Sent';
 }
 
 function renderWaiting() {
@@ -1022,9 +1063,9 @@ document.getElementById('xlsx').addEventListener('click', () => {
 document.getElementById('csv').addEventListener('click', () => {
   const rows = filtered();
   const cell = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
-  const csv = ['Guest,Number,Country,Email,Overview sent,Source,Mode,Scan date,Scan time,Last seen',
+  const csv = ['Guest,Number,Country,Email,Overview sent,SMS,Source,Mode,Scan date,Scan time,Last seen',
     ...rows.map((c) => [c.profile_name || '', c.wa_id, c.country || '', c.email || '', c.email_at ? when(c.email_at) : '',
-      c.source || '', c.bot_silent ? 'needs a person' : c.mode,
+      smsState(c), c.source || '', c.bot_silent ? 'needs a person' : c.mode,
       dayOf(c.created_at), timeOf(c.created_at), when(c.last_seen_at)].map(cell).join(','))].join('\\n');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob(['\\ufeff' + csv], { type: 'text/csv' }));
