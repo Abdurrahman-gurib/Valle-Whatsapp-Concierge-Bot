@@ -102,6 +102,10 @@ These are enforced in code and covered by the test suite:
    - from the **back office** with `#claim`.
    The chat stays with the human until someone runs `#release` (`HUMAN_TAKEOVER_MINUTES=0`).
    The bot's own messages echo back too and are recognised, so it never pauses itself.
+   A guest who sends the ATM Dubai QR message again gets the assistant back straight away,
+   even if a colleague wrote to them a moment ago: that message is the on-switch (rule 1),
+   and the colleague's next reply pauses the bot again. Chats where the guest asked for a
+   person, or that the team muted with `#mute`, are never restarted by a scan.
 3. **No double messages.** Incoming webhooks are deduplicated by WhatsApp message id;
    messages from one guest are processed strictly one at a time; and because writing an
    AI answer or transcribing a voice note takes seconds, the bot re-checks ownership

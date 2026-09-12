@@ -219,21 +219,6 @@ export async function hasOutboundMessage(waMessageId) {
 }
 
 /**
- * Minutes since a colleague last wrote to this guest (from the app or the back
- * office). null when no colleague has ever written. Used to decide whether a
- * fresh QR scan may restart the concierge.
- */
-export async function minutesSinceLastAgentMessage(contactId) {
-  const { rows } = await q(
-    `SELECT max(created_at) AS at FROM messages WHERE contact_id = $1 AND author = 'agent'`,
-    [contactId]
-  );
-  const at = rows[0]?.at;
-  if (!at) return null;
-  return (Date.now() - new Date(at).getTime()) / 60000;
-}
-
-/**
  * Documents and photo sets this guest has already received, newest first.
  * Lets the assistant refer back to them instead of sending the same file twice.
  */

@@ -94,10 +94,6 @@ export const config = {
     // the bot. 0 (the default) means never: once a person answers a guest, the
     // bot stays out until someone releases the chat with #release.
     humanTakeoverMinutes: Number(process.env.HUMAN_TAKEOVER_MINUTES || 0),
-    // A guest who scans a QR code restarts the concierge, provided no colleague
-    // has written to them in this many minutes. Protects a live conversation
-    // while letting a returning guest reach the assistant again.
-    qrReactivateMinutes: Number(process.env.QR_REACTIVATE_MINUTES || 60),
     openHour: Number(process.env.OPEN_HOUR || 9),
     closeHour: Number(process.env.CLOSE_HOUR || 17),
     timezone: process.env.TIMEZONE || 'Indian/Mauritius',

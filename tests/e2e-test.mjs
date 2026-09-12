@@ -643,7 +643,7 @@ console.log('\n15. QR-only gate: strangers get silence, QR scanners get replies'
 /* ═══ 23. Real-world flows that broke in production ═══ */
 console.log('\n23. Guest flows end to end: QR precision, voice extras, any-language attachments');
 {
-  const { handleIncomingMessage } = await import('../src/bot/router.js');
+  const { handleIncomingMessage, handleStaffEcho } = await import('../src/bot/router.js');
   const { config: cfg } = await import('../src/core/config.js');
   cfg.bot.mode = 'hybrid';
   cfg.stt.openaiKey = 'sk-test-whisper';
@@ -701,16 +701,57 @@ console.log('\n23. Guest flows end to end: QR precision, voice extras, any-langu
   check('QR scan after a quiet handover → concierge resumes',
     resumed.mode === 'bot' && seen.length > n, `mode=${resumed.mode}`);
 
-  // (d) But a colleague replying RIGHT NOW keeps the chat.
+  // (d) A colleague replied a moment ago; the guest sends the ATM message again
+  //     → the concierge resumes anyway. That message is the on-switch, and a
+  //     guest who sends it is asking for the assistant. (12 Sept: two testers
+  //     scanned minutes after a colleague wrote to them and got silence.)
   await dbMod.setMode('971555000001', 'human', 'app');
   await dbMod.q(`INSERT INTO messages (contact_id, direction, author, body) VALUES ($1,'out','agent','just now')`,
     [scanner.id]);
   n = seen.length;
   await handleIncomingMessage(inbound('971555000001', ATM),
     { wa_id: '971555000001', profile: { name: 'Aisha' } });
-  const stillHuman = await dbMod.getContactByWaId('971555000001');
-  check('QR scan never interrupts a live colleague',
-    stillHuman.mode === 'human' && seen.length === n, `mode=${stillHuman.mode}`);
+  const rescanned = await dbMod.getContactByWaId('971555000001');
+  check('QR scan right after a colleague wrote → concierge resumes anyway',
+    rescanned.mode === 'bot' && said()[0]?.interactive?.type === 'list' && seen.length > n,
+    `mode=${rescanned.mode} sent=${seen.length - n}`);
+
+  // (d2) ...and the colleague's very next message from the app pauses it again.
+  await handleStaffEcho({ to: '971555000001', id: 'wamid.echo.aisha.1', type: 'text', text: { body: 'Hi Aisha, Sam here' } });
+  const pausedAgain = await dbMod.getContactByWaId('971555000001');
+  check("the colleague's next reply pauses the bot again", pausedAgain.mode === 'human', `mode=${pausedAgain.mode}`);
+
+  // (d3) A chat claimed from the back office resumes too, and the agent is freed.
+  await dbMod.upsertAgent('23052928841', 'Manager', 'manager');
+  await dbMod.setMode('971555000001', 'human', '23052928841');
+  await dbMod.setAgentActiveChat('23052928841', '971555000001');
+  n = seen.length;
+  await handleIncomingMessage(inbound('971555000001', ATM),
+    { wa_id: '971555000001', profile: { name: 'Aisha' } });
+  const unclaimed = await dbMod.getContactByWaId('971555000001');
+  const manager = await dbMod.getAgent('23052928841');
+  check('QR scan on a back-office claim → concierge resumes, agent freed',
+    unclaimed.mode === 'bot' && !unclaimed.claimed_by && !manager?.active_chat && seen.length > n,
+    `mode=${unclaimed.mode} claimed_by=${unclaimed.claimed_by} active_chat=${manager?.active_chat}`);
+
+  // (d4) A guest who asked for a person stays with the team, scan or no scan.
+  await dbMod.setMode('971555000001', 'waiting');
+  await dbMod.setBotSilent('971555000001', true);
+  n = seen.length;
+  await handleIncomingMessage(inbound('971555000001', ATM),
+    { wa_id: '971555000001', profile: { name: 'Aisha' } });
+  const askedForPerson = await dbMod.getContactByWaId('971555000001');
+  check('a guest who asked for a person is not restarted by a scan',
+    askedForPerson.bot_silent === true && seen.length === n,
+    `silent=${askedForPerson.bot_silent} sent=${seen.length - n}`);
+
+  // (d5) Nor is a chat the team muted.
+  await dbMod.setMode('971555000001', 'paused');
+  n = seen.length;
+  await handleIncomingMessage(inbound('971555000001', ATM),
+    { wa_id: '971555000001', profile: { name: 'Aisha' } });
+  const muted = await dbMod.getContactByWaId('971555000001');
+  check('a muted chat is not restarted by a scan', muted.mode === 'paused' && seen.length === n, `mode=${muted.mode}`);
   await dbMod.setMode('971555000001', 'bot');
 
   // (e) VOICE: asking for photos out loud sends photos.

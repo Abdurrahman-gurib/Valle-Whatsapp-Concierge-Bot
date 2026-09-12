@@ -307,17 +307,24 @@ export async function handleIncomingMessage(msg, contactProfile) {
   if (!hadSource && source) welcomeBySms(contact);
 
   /* ---- 2c. A fresh QR scan restarts the concierge ---- */
-  // A guest who scans a Vallé code is explicitly asking for the assistant. If a
-  // colleague handled this chat earlier but has been quiet for a while, the scan
-  // opens a new concierge session. If a colleague is mid-conversation right now,
-  // the scan changes nothing: the person keeps the chat.
+  // The ATM Dubai message is the one thing that switches the assistant on
+  // (rule 1), so it always does, even in a chat a colleague answered a moment
+  // ago: a guest who sends it again is explicitly asking for the assistant.
+  // (12 Sept: two testers scanned minutes after a colleague had written to them
+  // and were met with silence by the old "quiet for 60 minutes" guard.)
+  // The colleague takes the chat back the instant they write again (rule 2),
+  // and every slow step still re-checks ownership before sending (rule 3).
+  // Two states are deliberate and stay untouched: a guest who asked for a
+  // person (bot_silent, rule 4) and a chat the team muted (paused). Only a
+  // colleague or #release lifts those.
   if (contact.mode === 'human' && isQrPrefillText(text)) {
-    const quietFor = await db.minutesSinceLastAgentMessage(contact.id);
-    if (quietFor === null || quietFor >= config.bot.qrReactivateMinutes) {
-      await db.setMode(from, 'bot');
-      contact.mode = 'bot';
-      console.log(`[router] QR scanned after ${quietFor ?? '∞'} min of team silence — concierge resumed for`, from);
+    if (contact.claimed_by && contact.claimed_by !== APP_AGENT) {
+      await db.setAgentActiveChat(contact.claimed_by, null);
     }
+    await db.setMode(from, 'bot');
+    contact.mode = 'bot';
+    contact.claimed_by = null;
+    console.log('[router] QR scanned — concierge resumed for', from);
   }
 
   /* ---- 3a. THE GUEST ASKED FOR A PERSON — total silence ---- */
