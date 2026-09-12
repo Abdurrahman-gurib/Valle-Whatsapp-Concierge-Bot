@@ -59,7 +59,12 @@ async function call(method, url, form) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(`${method} ${url.replace(SID, 'AC…')} → ${res.status} ${data.message || ''}${data.code ? ` (code ${data.code})` : ''}`);
+    const kyc = /compliance profile|KYC/i.test(data.message || '')
+      ? '\n  → Complete the KYC form first: Twilio Console → Trust Hub → Customer profiles'
+        + ' (https://console.twilio.com/us1/account/trust-hub/customer-profiles).'
+        + ' Nothing can be sent or bought until it is approved.'
+      : '';
+    throw new Error(`${method} ${url.replace(SID, 'AC…')} → ${res.status} ${data.message || ''}${data.code ? ` (code ${data.code})` : ''}${kyc}`);
   }
   return data;
 }
@@ -181,4 +186,4 @@ if (!commands[cmd]) {
   console.error('Usage: node scripts/twilio-setup.js status | numbers <ISO> | buy <+number> --yes | service --name "Valle" [--alpha VALLE] [--number +…] | test <+number> [text]');
   process.exit(1);
 }
-commands[cmd]().catch((err) => { console.error(err.message); process.exit(1); });
+commands[cmd]().catch((err) => { console.error(err.message); process.exitCode = 1; });

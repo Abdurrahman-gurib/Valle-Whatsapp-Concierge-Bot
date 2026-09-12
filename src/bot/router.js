@@ -66,7 +66,7 @@ function welcomeBySms(contact) {
         // guest has no text: a country not enabled, a STOP, a bad number.
         await db.logMessage({
           contactId: contact.id, direction: 'out', author: 'system',
-          body: `[sms: failed ${r.code}${r.hint ? ' — ' + r.hint : ''}]`,
+          body: `[sms: failed ${r.code}${(r.hint || r.message) ? ' — ' + (r.hint || r.message) : ''}]`,
         });
       }
     })

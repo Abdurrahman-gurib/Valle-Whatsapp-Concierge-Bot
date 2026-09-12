@@ -140,6 +140,7 @@ export const statusCallbackUrl = () =>
 
 /** What the team can do about the Twilio errors we expect to meet. */
 const HINTS = {
+  20003: 'Twilio refused the account: the credentials are wrong, or the KYC compliance profile in Trust Hub is not approved yet',
   21211: 'the number is not a valid phone number',
   21408: 'this country is not enabled for SMS: Twilio Console → Messaging → Settings → Geo permissions',
   21606: 'the From number cannot text this country; use a Messaging Service with a sender the country accepts',
