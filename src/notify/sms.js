@@ -27,7 +27,7 @@ const API = 'https://api.twilio.com/2010-04-01';
 const TIMEOUT_MS = 15_000;
 
 /** True when Twilio is configured well enough to send. */
-export const smsEnabled = () => Boolean(
+export const smsEnabled = () => config.sms.enabled !== false && Boolean(
   config.sms.accountSid && config.sms.authToken
   && (config.sms.from || config.sms.messagingServiceSid || config.sms.alphaSender)
 );
@@ -37,16 +37,19 @@ export const smsEnabled = () => Boolean(
 /**
  * Countries whose operators show an unregistered alphanumeric sender such as
  * "Valle" as it is, per Twilio's per-country SMS guidelines on 12 Sept 2026:
- * Mauritius, Réunion, the UK, Germany, Italy, Ukraine, Bahrain and Pakistan.
- * Everywhere else the guest sees the number in TWILIO_FROM instead (India
- * even rewrites that into a random short number, which is normal there).
+ * Mauritius, Réunion, the UK, France, Germany, Italy, Ukraine, Bahrain, Egypt,
+ * Pakistan and Kenya. France, Egypt and Kenya are here because their operators
+ * do not deliver a foreign number at all; Pakistan and Kenya may swap the name
+ * for a generic one on some networks. Everywhere else the guest sees the
+ * number in TWILIO_FROM instead (India even rewrites that into a random short
+ * number, which is normal there).
  */
-const ALPHA_PREFIXES = ['230', '262', '44', '49', '39', '380', '973', '92'];
+const ALPHA_PREFIXES = ['230', '262', '44', '33', '49', '39', '380', '973', '20', '92', '254'];
 
 /**
  * Countries not worth a text today: the operators only deliver sender IDs
  * registered weeks in advance (UAE, Saudi Arabia, Qatar, Kuwait), there is no
- * route (Russia), promotional SMS is blocked (Turkey), or an unregistered
+ * route (Russia), marketing SMS is blocked (Turkey, China), or an unregistered
  * number is blocked (USA and Canada). The guest still gets the WhatsApp reply, and the
  * dashboard shows why the text was skipped. SMS_SKIP_COUNTRIES (dial prefixes,
  * comma separated) replaces this list, e.g. drop 971 once the UAE sender ID
@@ -56,9 +59,10 @@ const DEFAULT_SKIP = {
   971: 'UAE operators only deliver sender IDs registered weeks in advance',
   966: 'Saudi operators only deliver sender IDs registered weeks in advance',
   974: 'Qatar operators only deliver sender IDs registered weeks in advance',
-  965: 'Kuwait operators block unregistered senders from 15 Sept 2026',
+  965: 'Kuwait: Ooredoo and Zain block unregistered senders from 15 Sept 2026, Viva rejects numbers',
   7: 'no SMS route to Russia',
   90: 'promotional SMS is blocked in Turkey',
+  86: 'China does not allow marketing SMS or links from abroad',
   1: 'USA and Canada block unregistered numbers',
 };
 
@@ -147,6 +151,8 @@ const HINTS = {
   30006: 'the number is a landline or cannot receive SMS',
   30007: 'the carrier filtered the message; register the sender ID for that country',
   30008: 'the carrier gave no reason',
+  30018: 'this country wants a pre-registered sender ID, so delivery is not guaranteed; register "Valle" for it under Numbers and Senders → Alphanumeric senders',
+  30040: 'blocked: this country only delivers pre-registered sender IDs; register "Valle" for it before texting there',
   30034: 'the sender is not registered for this destination (US A2P 10DLC or a sender-ID registration)',
 };
 export const smsHint = (code) => HINTS[Number(code)] || '';
@@ -194,8 +200,9 @@ export async function sendSms(waId, body) {
     if (!res.ok) {
       const code = data.code || res.status;
       const hint = smsHint(code);
-      // The guest said STOP, or the number is not a phone: their side, not ours.
-      const quiet = code === 21610 || code === 21211;
+      // STOP, not a phone, a landline: the guest's side, not ours. 21408 (the
+      // country is not enabled) stays loud on purpose.
+      const quiet = code === 21610 || code === 21211 || code === 21614;
       console[quiet ? 'log' : 'error'](
         `[sms] not sent to ${to}: ${data.message || res.status} (${code})${hint ? ' — ' + hint : ''}`);
       return { ok: false, code, message: data.message || `HTTP ${res.status}`, hint };

@@ -1634,7 +1634,7 @@ console.log('\n32. A scan also texts their phone; the overview goes out by email
     bcc: 'abdurrahman@valle.mu, ashfaaq@valle.mu' };
 
   const { handleIncomingMessage } = await import('../src/bot/router.js');
-  const { segments, toE164, senderFor } = await import('../src/notify/sms.js');
+  const { segments, toE164, senderFor, smsEnabled } = await import('../src/notify/sms.js');
   const { findEmail } = await import('../src/notify/email.js');
 
   const out = [], sms = [], mails = [];
@@ -1781,6 +1781,7 @@ console.log('\n32. A scan also texts their phone; the overview goes out by email
   await handleIncomingMessage(inbound(G8, ATM), { wa_id: G8, profile: { name: 'Ali' } });
   await new Promise((r) => setImmediate(r));
   check('SMS_ENABLED=false sends nothing', sms.length === off);
+  check('and smsEnabled() itself says so, so the setup script honours the switch too', smsEnabled() === false);
   check('segment maths: 71 trademark signs are two UCS-2 SMS, 307 letters are three',
     segments('™'.repeat(71)) === 2 && segments('a'.repeat(307)) === 3);
 
@@ -1789,11 +1790,12 @@ console.log('\n32. A scan also texts their phone; the overview goes out by email
     alphaSender: 'Valle', skipCountries: '', enabled: true };
   check('a Mauritian number sees the park\'s name as the sender', senderFor('23052928841').from === 'Valle');
   check('a British number too', senderFor('447700900123').from === 'Valle');
-  check('a French number sees the Twilio number instead', senderFor('33612345678').from === '+15550001111');
+  check("a French number sees the park's name too: French operators drop foreign numbers", senderFor('33612345678').from === 'Valle');
+  check('a Spanish number sees the Twilio number instead', senderFor('34612345678').from === '+15550001111');
   check('an Indian number too', senderFor('919876543210').from === '+15550001111');
   check('a UAE number is skipped, with the reason', /registered weeks in advance/.test(senderFor('971501234567').skip || ''));
-  check('Saudi, Qatar, Russia, Turkey and the USA are skipped too',
-    ['966501234567', '97433123456', '79161234567', '905321234567', '12125551234'].every((n) => senderFor(n).skip));
+  check('Saudi, Qatar, Kuwait, Russia, Turkey, China and the USA are skipped too',
+    ['966501234567', '97433123456', '96550123456', '79161234567', '905321234567', '8613800138000', '12125551234'].every((n) => senderFor(n).skip));
   cfg.sms.skipCountries = '7,90';
   check('SMS_SKIP_COUNTRIES replaces the list: the UAE is texted once its sender ID is registered',
     senderFor('971501234567').from === '+15550001111' && senderFor('79161234567').skip);
@@ -1803,8 +1805,8 @@ console.log('\n32. A scan also texts their phone; the overview goes out by email
   check('but the skip list still applies', senderFor('971501234567').skip);
   cfg.sms.messagingServiceSid = '';
   cfg.sms.from = '';
-  check('an alphanumeric sender alone cannot text France, and says what to set',
-    /set TWILIO_FROM/.test(senderFor('33612345678').none || '') && senderFor('23052928841').from === 'Valle');
+  check('an alphanumeric sender alone cannot text Spain, and says what to set',
+    /set TWILIO_FROM/.test(senderFor('34612345678').none || '') && senderFor('23052928841').from === 'Valle');
   cfg.sms.from = '+15550001111';
 
   // A UAE guest scanning today: WhatsApp answers, no Twilio call, the dashboard learns why.

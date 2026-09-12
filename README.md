@@ -161,12 +161,13 @@ it is fired and forgotten, one attempt, with a 15-second timeout.
 Who the guest sees as the sender depends on their country (`senderFor`):
 
 - **"Valle"**, an alphanumeric sender (`TWILIO_ALPHA_SENDER`), where operators show it without
-  registration: Mauritius, Réunion, the UK, Germany, Italy, Ukraine, Bahrain, Pakistan.
+  registration: Mauritius, Réunion, the UK, France, Germany, Italy, Ukraine, Bahrain, Egypt,
+  Pakistan and Kenya.
 - **The Twilio number** (`TWILIO_FROM`) everywhere else. India rewrites it into a random short
   number; that is normal there.
 - **Skipped, with the reason on the dashboard**: the UAE, Saudi Arabia, Qatar and Kuwait only
   deliver sender IDs registered with their operators weeks in advance; Russia has no route;
-  Turkey blocks promotional SMS; the USA and Canada block unregistered numbers. Those guests
+  Turkey and China block marketing SMS; the USA and Canada block unregistered numbers. Those guests
   still get the full WhatsApp welcome. `SMS_SKIP_COUNTRIES` replaces the list once a sender ID
   is registered.
 

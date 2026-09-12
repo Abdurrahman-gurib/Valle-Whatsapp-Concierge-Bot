@@ -26,7 +26,7 @@
  *       follow its delivery status for half a minute.
  */
 import 'dotenv/config';
-import { WELCOME_SMS, segments } from '../src/notify/sms.js';
+import { WELCOME_SMS, segments, senderFor } from '../src/notify/sms.js';
 
 const SID = process.env.TWILIO_ACCOUNT_SID || '';
 const TOKEN = process.env.TWILIO_AUTH_TOKEN || '';
@@ -91,8 +91,13 @@ async function status() {
     if (!alpha.alpha_senders.length && !phones.phone_numbers.length) console.log('      (no senders yet)');
   }
 
-  console.log('\nThe bot would send with:',
-    SERVICE ? `Messaging Service ${SERVICE}` : FROM ? `From ${FROM}` : 'NOTHING — set TWILIO_MESSAGING_SERVICE_SID or TWILIO_FROM');
+  console.log('\nWhat a guest would see as the sender (senderFor, exactly the bot\'s routing):');
+  for (const [label, n] of [['Mauritius', '+23052928841'], ['UK', '+447700900123'], ['France', '+33612345678'],
+    ['India', '+919876543210'], ['Spain', '+34612345678'], ['UAE', '+971501234567'], ['USA', '+12125551234']]) {
+    const s = senderFor(n);
+    console.log(`  ${label.padEnd(10)} ${s.skip ? 'skipped: ' + s.skip : s.none ? 'NO SENDER: ' + s.none
+      : s.messagingServiceSid ? 'Messaging Service ' + s.messagingServiceSid : s.from}`);
+  }
   console.log('Delivery reports go to:', PUBLIC ? `${PUBLIC}/twilio/status` : 'nowhere (no PUBLIC_URL / RAILWAY_PUBLIC_DOMAIN here; Railway has one)');
   console.log(`Welcome text: ${WELCOME_SMS.length} characters, ${segments(WELCOME_SMS)} segment(s)`);
 }
@@ -153,8 +158,13 @@ async function test() {
   const to = positional[0];
   if (!to?.startsWith('+')) throw new Error('give the phone in E.164, e.g. test +23052928841');
   const body = positional[1] || WELCOME_SMS;
-  if (!SERVICE && !FROM) throw new Error('set TWILIO_MESSAGING_SERVICE_SID or TWILIO_FROM first');
-  const form = { To: to, Body: body, ...(SERVICE ? { MessagingServiceSid: SERVICE } : { From: FROM }) };
+  // Exactly the bot's routing: the sender this guest would see, or the skip.
+  const sender = senderFor(to);
+  if (sender.skip) throw new Error(`the bot would skip ${to}: ${sender.skip} (SMS_SKIP_COUNTRIES=none forces it)`);
+  if (sender.none) throw new Error(sender.none);
+  console.log(`Sending to ${to} as ${sender.messagingServiceSid || sender.from}`);
+  const form = { To: to, Body: body,
+    ...(sender.messagingServiceSid ? { MessagingServiceSid: sender.messagingServiceSid } : { From: sender.from }) };
   if (PUBLIC) form.StatusCallback = `${PUBLIC}/twilio/status`;
   const m = await post(`${REST}/Messages.json`, form);
   console.log(`Accepted: sid ${m.sid}, status ${m.status}, ${segments(body)} segment(s), price ${m.price ?? 'pending'}`);

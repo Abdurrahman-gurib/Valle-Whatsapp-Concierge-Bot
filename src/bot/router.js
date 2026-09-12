@@ -48,7 +48,7 @@ const APP_AGENT = 'app';
  * cost them their WhatsApp reply.
  */
 function welcomeBySms(contact) {
-  if (!smsEnabled() || !config.sms.enabled || contact.sms_at) return;
+  if (!smsEnabled() || contact.sms_at) return;
   sendSms(contact.wa_id, WELCOME_SMS)
     .then(async (r) => {
       if (r.ok) {
