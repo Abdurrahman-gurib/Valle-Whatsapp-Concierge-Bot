@@ -67,6 +67,14 @@ const countryOf = (waId) => {
 /** A YYYY-MM-DD string or null; anything else is rejected, never interpolated. */
 const dayParam = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? v : null);
 
+/**
+ * A scan is a guest's message carrying the ATM Dubai QR text: the same test as
+ * QR_SOURCES in the router, in Postgres regex form. Scans are counted as
+ * messages, not as contacts, so a re-scan and a scan by someone the team
+ * already had in the inbox both move the numbers, on the day they happened.
+ */
+const SCAN_MATCH = `direction = 'in' AND body ~* '\\yatm\\s*dubai\\y'`;
+
 /** The welcome SMS as Twilio last reported it: '', 'sent', 'delivered' or 'failed'. */
 const smsStateOf = (c) => {
   if (!c.sms_at && !c.sms_status) return '';
@@ -107,10 +115,11 @@ export function mountDashboard(app) {
     if (!authed(req)) return res.sendStatus(403);
     try {
       const [stats, series, scans, hourlyScans, hourlyMsgs, scanEvents, outAuthors, msgTypes, avgReply,
-             perAgent, unanswered, deleted, waiting, leads, contacts, messages] = await Promise.all([
+             perAgent, unanswered, deleted, waiting, leads, contacts, messages, atm] = await Promise.all([
         q(`SELECT
              (SELECT count(*) FROM contacts)                                                        AS total_contacts,
-             (SELECT count(*) FROM contacts WHERE source IS NOT NULL)                               AS qr_scans,
+             (SELECT count(*) FROM contacts WHERE source IS NOT NULL)                               AS qr_guests,
+             (SELECT count(*) FROM messages WHERE ${SCAN_MATCH})                                    AS qr_scans,
              (SELECT count(*) FROM contacts WHERE last_seen_at > now() - interval '24 hours')       AS active_24h,
              (SELECT count(*) FROM contacts WHERE mode = 'waiting')                                 AS waiting,
              (SELECT count(*) FROM contacts WHERE mode = 'human')                                   AS in_human,
@@ -124,10 +133,10 @@ export function mountDashboard(app) {
              FROM messages WHERE created_at > now() - interval '14 days'
             GROUP BY 1, 2 ORDER BY 1`, [TZ]),
         q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day, count(*) AS n
-             FROM contacts WHERE source IS NOT NULL AND created_at > now() - interval '14 days'
+             FROM messages WHERE ${SCAN_MATCH} AND created_at > now() - interval '14 days'
             GROUP BY 1 ORDER BY 1`, [TZ]),
         q(`SELECT to_char(created_at AT TIME ZONE $1, 'HH24') AS hour, count(*) AS n
-             FROM contacts WHERE source IS NOT NULL GROUP BY 1 ORDER BY 1`, [TZ]),
+             FROM messages WHERE ${SCAN_MATCH} GROUP BY 1 ORDER BY 1`, [TZ]),
         q(`SELECT to_char(created_at AT TIME ZONE $1, 'HH24') AS hour, count(*) AS n
              FROM messages WHERE direction = 'in' AND created_at > now() - interval '14 days'
             GROUP BY 1 ORDER BY 1`, [TZ]),
@@ -135,7 +144,7 @@ export function mountDashboard(app) {
                   to_char(created_at AT TIME ZONE $1, 'HH24:MI') AS tod,
                   EXTRACT(HOUR FROM created_at AT TIME ZONE $1)
                   + EXTRACT(MINUTE FROM created_at AT TIME ZONE $1) / 60.0 AS y
-             FROM contacts WHERE source IS NOT NULL ORDER BY created_at ASC LIMIT 2000`, [TZ]),
+             FROM messages WHERE ${SCAN_MATCH} ORDER BY created_at ASC LIMIT 2000`, [TZ]),
         q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day, author, count(*) AS n
              FROM messages WHERE direction = 'out' AND created_at > now() - interval '14 days'
             GROUP BY 1, 2 ORDER BY 1`, [TZ]),
@@ -180,6 +189,23 @@ export function mountDashboard(app) {
              FROM messages m JOIN contacts c ON c.id = m.contact_id
              LEFT JOIN attachments a ON a.message_id = m.id
             ORDER BY m.created_at DESC LIMIT 50`),
+        // One row per guest who scanned, with their scan times and counts: the
+        // ATM Dubai section of the page.
+        q(`SELECT c.wa_id, c.profile_name, c.email, c.email_at, c.sms_at, c.source, c.mode, c.bot_silent,
+                  c.created_at, c.last_seen_at,
+                  s.first_scan_at, s.last_scan_at, s.scans,
+                  (SELECT count(*) FROM messages m WHERE m.contact_id = c.id
+                     AND m.direction = 'in' AND m.author = 'customer')                             AS msgs_in,
+                  (SELECT count(*) FROM messages m WHERE m.contact_id = c.id
+                     AND m.direction = 'out' AND m.author IN ('bot', 'agent'))                     AS msgs_out,
+                  (SELECT m.body FROM messages m WHERE m.contact_id = c.id AND m.body LIKE '[sms:%'
+                    ORDER BY m.created_at DESC LIMIT 1)                                             AS sms_status
+             FROM contacts c
+             JOIN LATERAL (SELECT min(created_at) AS first_scan_at, max(created_at) AS last_scan_at,
+                                  count(*) AS scans
+                             FROM messages WHERE contact_id = c.id AND ${SCAN_MATCH}) s ON true
+            WHERE c.source IS NOT NULL
+            ORDER BY s.last_scan_at DESC NULLS LAST LIMIT 2000`),
       ]);
       res.json({
         now: new Date().toISOString(),
@@ -200,6 +226,7 @@ export function mountDashboard(app) {
         leads: leads.rows,
         contacts: contacts.rows.map((c) => ({ ...c, country: countryOf(c.wa_id) })),
         messages: messages.rows.map(withAttachment),
+        atm: atm.rows.map((c) => ({ ...c, country: countryOf(c.wa_id) })),
       });
     } catch (err) {
       console.error('[dashboard] data', err);
@@ -221,17 +248,24 @@ export function mountDashboard(app) {
       const P = [TZ, from, to];
 
       const [guests, daily, hourly, msgDaily] = await Promise.all([
+        // Guests with at least one scan in the range; the times are those scans'.
         q(`SELECT c.profile_name, c.wa_id, c.email, c.email_at, c.sms_at, c.source, c.mode, c.last_seen_at,
-                  to_char(c.created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS scan_date,
-                  to_char(c.created_at AT TIME ZONE $1, 'HH24:MI:SS') AS scan_time,
+                  to_char(s.first_scan_at AT TIME ZONE $1, 'YYYY-MM-DD') AS scan_date,
+                  to_char(s.first_scan_at AT TIME ZONE $1, 'HH24:MI:SS') AS scan_time,
+                  to_char(s.last_scan_at AT TIME ZONE $1, 'YYYY-MM-DD HH24:MI:SS') AS last_scan,
+                  s.scans,
                   (SELECT m.body FROM messages m WHERE m.contact_id = c.id AND m.body LIKE '[sms:%'
                     ORDER BY m.created_at DESC LIMIT 1) AS sms_status
-             FROM contacts c WHERE c.source IS NOT NULL AND ${RANGE}
-            ORDER BY c.created_at ASC`, P),
+             FROM contacts c
+             JOIN LATERAL (SELECT min(created_at) AS first_scan_at, max(created_at) AS last_scan_at,
+                                  count(*) AS scans
+                             FROM messages WHERE contact_id = c.id AND ${SCAN_MATCH} AND ${RANGE}) s ON true
+            WHERE c.source IS NOT NULL AND s.scans > 0
+            ORDER BY s.first_scan_at ASC`, P),
         q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day, count(*) AS scans
-             FROM contacts WHERE source IS NOT NULL AND ${RANGE} GROUP BY 1 ORDER BY 1`, P),
+             FROM messages WHERE ${SCAN_MATCH} AND ${RANGE} GROUP BY 1 ORDER BY 1`, P),
         q(`SELECT to_char(created_at AT TIME ZONE $1, 'HH24') AS hour, count(*) AS n
-             FROM contacts WHERE source IS NOT NULL AND ${RANGE} GROUP BY 1 ORDER BY 1`, P),
+             FROM messages WHERE ${SCAN_MATCH} AND ${RANGE} GROUP BY 1 ORDER BY 1`, P),
         q(`SELECT to_char(created_at AT TIME ZONE $1, 'YYYY-MM-DD') AS day,
                   count(*) FILTER (WHERE direction = 'in')  AS from_guests,
                   count(*) FILTER (WHERE direction = 'out') AS replies
@@ -268,7 +302,8 @@ export function mountDashboard(app) {
       s.addRows([
         { k: 'Report range (Mauritius days)', v: (from || 'campaign start') + ' to ' + (to || 'today') },
         { k: 'Generated', v: local(new Date()) + ' (Mauritius time)' },
-        { k: 'QR scans in range', v: guests.rows.length },
+        { k: 'QR scans in range', v: daily.rows.reduce((x, r) => x + Number(r.scans), 0) },
+        { k: 'QR guests in range', v: guests.rows.length },
         { k: 'Emails captured in range', v: guests.rows.filter((c) => c.email).length },
         { k: 'Overviews emailed in range', v: guests.rows.filter((c) => c.email_at).length },
         { k: 'Welcome SMS sent in range', v: guests.rows.filter((c) => c.sms_at).length },
@@ -285,6 +320,8 @@ export function mountDashboard(app) {
       g.columns = [
         { header: 'Scan date', key: 'sd', width: 12 },
         { header: 'Scan time', key: 'st', width: 11 },
+        { header: 'Scans', key: 'scans', width: 7 },
+        { header: 'Last scan', key: 'last', width: 20 },
         { header: 'Guest', key: 'name', width: 26 },
         { header: 'Number', key: 'num', width: 16 },
         { header: 'Country', key: 'country', width: 16 },
@@ -296,7 +333,7 @@ export function mountDashboard(app) {
         { header: 'Last seen', key: 'seen', width: 20 },
       ];
       for (const c of guests.rows) {
-        g.addRow({ sd: c.scan_date, st: c.scan_time, name: c.profile_name || '',
+        g.addRow({ sd: c.scan_date, st: c.scan_time, scans: Number(c.scans), last: c.last_scan, name: c.profile_name || '',
           num: c.wa_id, country: countryOf(c.wa_id), email: c.email || '',
           sent: local(c.email_at), sms: smsStateOf(c), src: c.source, mode: c.mode, seen: local(c.last_seen_at) });
       }
@@ -653,6 +690,25 @@ const PAGE = `<!doctype html>
   <h2>Awaiting a reply</h2>
   <div class="card scroll" id="unanswered"></div>
 
+  <h2>ATM Dubai 2026 guests</h2>
+  <div class="bar">
+    <input type="search" id="aq" placeholder="Search name, number, email or country…">
+    <input type="date" id="aFrom" title="First day of the range (Mauritius time)">
+    <input type="date" id="aTo" title="Last day of the range (Mauritius time)">
+    <button class="btn ghost sm" data-arange="today">Today</button>
+    <button class="btn ghost sm" data-arange="yesterday">Yesterday</button>
+    <button class="btn ghost sm" data-arange="show">ATM days</button>
+    <button class="btn ghost sm" data-arange="all">All</button>
+    <select id="aEmail"><option value="">Email: all</option><option value="has">captured</option><option value="none">missing</option></select>
+    <button class="btn go" id="atmXlsx" title="Excel workbook for these days: every ATM guest with number, country, email, SMS and scan times, plus the daily timeline and the hourly profile">Download Excel</button>
+    <button class="btn ghost" id="atmCsv">CSV</button>
+    <span class="count" id="aCount"></span>
+  </div>
+  <div class="card scroll"><table>
+    <thead><tr><th>Guest</th><th>Number</th><th>Country</th><th>Email</th><th>SMS</th><th>First scan</th><th>Last scan</th><th>Scans</th><th>Msgs</th><th>Mode</th><th></th></tr></thead>
+    <tbody id="atmRows"></tbody>
+  </table></div>
+
   <h2>Guests</h2>
   <div class="bar">
     <input type="search" id="q" placeholder="Search name, number or email…">
@@ -731,7 +787,7 @@ async function load() {
     D = await r.json();
   } catch (e) { toast('Could not refresh data (' + e.message + ')', true); return; }
   document.getElementById('updated').textContent = 'Live · updated ' + when(D.now) + ' (Mauritius time)';
-  tiles(); renderRows(); renderWaiting(); renderLeads(); renderFeed(); renderTeam(); renderUnanswered();
+  tiles(); renderAtm(); renderRows(); renderWaiting(); renderLeads(); renderFeed(); renderTeam(); renderUnanswered();
   // Charts come last and must never take the tables down with them: if the
   // Chart.js CDN is unreachable, the dashboard still works without graphs.
   try { if (typeof Chart !== 'undefined') drawCharts(); } catch (e) { console.warn('charts skipped:', e); }
@@ -752,7 +808,7 @@ function tiles() {
 
   const t = (n, l, cls='') => \`<div class="tile \${cls}"><div class="n num">\${n}</div><div class="l">\${l}</div></div>\`;
   document.getElementById('tiles').innerHTML =
-    t(s.total_contacts,'Guests') + t(s.qr_scans,'QR scans','go') + t(s.active_24h,'Active 24 h') +
+    t(s.total_contacts,'Guests') + t(s.qr_scans,'QR scans · ' + s.qr_guests + ' guests','go') + t(s.active_24h,'Active 24 h') +
     t(s.waiting,'Waiting', s.waiting > 0 ? 'warn' : '') + t(s.msgs_24h,'Messages 24 h') +
     t(s.leads_total,'Leads') + t(s.emails_captured,'Emails captured') + t(s.emails_sent,'Overviews sent','go') +
     t(s.sms_sent,'SMS sent' + (Number(s.sms_delivered) ? ' · ' + s.sms_delivered + ' delivered' : ''),'go') +
@@ -919,6 +975,46 @@ function filtered() {
 const pill = (text, color) => \`<span class="pill" style="background:\${color}">\${esc(text)}</span>\`;
 const modePill = (c) => c.bot_silent ? pill('needs a person', C.scarlet) : pill(c.mode, MODE_COLORS[c.mode] || C.dim);
 
+/* ── ATM Dubai 2026 guests: one row per guest who scanned, filtered by scan day ── */
+const SHOW_DAYS = ['2026-09-14', '2026-09-17'];   // ATM Dubai 2026, Mauritius days
+const atmRange = () => [document.getElementById('aFrom').value, document.getElementById('aTo').value];
+function atmFiltered() {
+  const qv = document.getElementById('aq').value.trim().toLowerCase();
+  const fe = document.getElementById('aEmail').value;
+  const [from, to] = atmRange();
+  return (D.atm || []).filter((c) => {
+    if (qv && !((c.profile_name || '') + ' ' + c.wa_id + ' ' + (c.email || '') + ' ' + (c.country || '')).toLowerCase().includes(qv)) return false;
+    if (fe === 'has' && !c.email) return false;
+    if (fe === 'none' && c.email) return false;
+    // A guest belongs to a range when one of their scans falls inside it.
+    const first = dayOf(c.first_scan_at), last = dayOf(c.last_scan_at);
+    if ((from || to) && !first) return false;
+    if (from && last < from) return false;
+    if (to && first > to) return false;
+    return true;
+  });
+}
+function renderAtm() {
+  const rows = atmFiltered();
+  const scans = rows.reduce((n, c) => n + Number(c.scans || 0), 0);
+  document.getElementById('aCount').textContent = rows.length + ' of ' + (D.atm || []).length + ' guests · ' + scans + ' scans';
+  document.getElementById('atmRows').innerHTML = rows.length ? rows.map((c) => \`
+    <tr class="click" data-wa="\${esc(c.wa_id)}">
+      <td>\${esc(c.profile_name || c.wa_id)}</td>
+      <td class="num">\${esc(c.wa_id)}</td>
+      <td>\${esc(c.country || '')}</td>
+      <td>\${c.email ? esc(c.email) + (c.email_at ? ' <span class="mail-ok">Sent</span>' : '') : '<span class="dim">·</span>'}</td>
+      <td>\${smsCell(c)}</td>
+      <td class="num">\${when(c.first_scan_at)}</td>
+      <td class="num">\${when(c.last_scan_at)}</td>
+      <td class="num">\${Number(c.scans || 0)}</td>
+      <td class="num" title="messages from the guest / replies to them">\${Number(c.msgs_in || 0)} / \${Number(c.msgs_out || 0)}</td>
+      <td>\${modePill(c)}</td>
+      <td><button class="btn ghost sm" data-mail="\${esc(c.wa_id)}" \${D.emailEnabled ? '' : 'disabled'}>Email</button></td>
+    </tr>\`).join('')
+    : '<tr><td colspan="11" class="empty">No ATM Dubai scans in this period.</td></tr>';
+}
+
 function renderRows() {
   const rows = filtered();
   document.getElementById('count').textContent = rows.length + ' of ' + D.contacts.length + ' guests';
@@ -1017,15 +1113,43 @@ async function sendOverview(waId, typedEmail) {
 for (const id of ['q', 'fSource', 'fMode', 'fEmail', 'fWhen', 'fDay'])
   document.getElementById(id).addEventListener('input', renderRows);
 
-document.getElementById('rows').addEventListener('click', (e) => {
+const onGuestRowClick = (e) => {
   const mail = e.target.closest('[data-mail]');
   if (mail) { e.stopPropagation();
-    const c = D.contacts.find((x) => x.wa_id === mail.dataset.mail);
+    const c = D.contacts.find((x) => x.wa_id === mail.dataset.mail) || (D.atm || []).find((x) => x.wa_id === mail.dataset.mail);
     if (c?.email) { if (confirm('Send the park overview to ' + c.email + '?')) sendOverview(c.wa_id); }
     else openModal(mail.dataset.mail);
     return; }
   const tr = e.target.closest('tr[data-wa]');
   if (tr) openModal(tr.dataset.wa);
+};
+document.getElementById('rows').addEventListener('click', onGuestRowClick);
+document.getElementById('atmRows').addEventListener('click', onGuestRowClick);
+
+for (const id of ['aq', 'aFrom', 'aTo', 'aEmail']) document.getElementById(id).addEventListener('input', renderAtm);
+document.querySelectorAll('[data-arange]').forEach((b) => b.addEventListener('click', () => {
+  const today = dayOf(new Date()), yesterday = dayOf(new Date(Date.now() - 864e5));
+  const r = { today: [today, today], yesterday: [yesterday, yesterday], show: SHOW_DAYS, all: ['', ''] }[b.dataset.arange];
+  document.getElementById('aFrom').value = r[0];
+  document.getElementById('aTo').value = r[1];
+  renderAtm();
+}));
+document.getElementById('atmXlsx').addEventListener('click', () => {
+  const [from, to] = atmRange();
+  location.href = api('/dashboard/report.xlsx') + (from ? '&from=' + from : '') + (to ? '&to=' + to : '');
+});
+document.getElementById('atmCsv').addEventListener('click', () => {
+  const rows = atmFiltered();
+  const [from, to] = atmRange();
+  const cell = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+  const csv = ['Guest,Number,Country,Email,Overview sent,SMS,First scan,Last scan,Scans,Messages from guest,Replies,Mode',
+    ...rows.map((c) => [c.profile_name || '', c.wa_id, c.country || '', c.email || '', c.email_at ? when(c.email_at) : '',
+      smsState(c), when(c.first_scan_at), when(c.last_scan_at), c.scans, c.msgs_in, c.msgs_out,
+      c.bot_silent ? 'needs a person' : c.mode].map(cell).join(','))].join('\\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['\\ufeff' + csv], { type: 'text/csv' }));
+  a.download = 'valle-atm-dubai-' + (from || 'all') + (to && to !== from ? '-to-' + to : '') + '.csv';
+  a.click();
 });
 document.getElementById('mClose').addEventListener('click', closeModal);
 document.getElementById('overlay').addEventListener('click', (e) => { if (e.target.id === 'overlay') closeModal(); });
