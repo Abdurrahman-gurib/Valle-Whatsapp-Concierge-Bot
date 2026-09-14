@@ -107,10 +107,6 @@ export async function markEmailSent(waId) {
   await q(`UPDATE contacts SET email_at = now() WHERE wa_id = $1`, [waId]);
 }
 
-export async function markSmsSent(waId) {
-  await q(`UPDATE contacts SET sms_at = now() WHERE wa_id = $1`, [waId]);
-}
-
 /** Has this exact internal marker already been logged for this contact? */
 export async function hasLoggedMarker(contactId, marker) {
   const { rows } = await q(

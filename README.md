@@ -52,13 +52,6 @@ Copy the environment template into `.env` and fill it in (see **Configuration**)
 | `QR_ONLY` | `true` = only guests who scanned a QR get replies. |
 | `ADMIN_NUMBERS` | Staff numbers allowed to use the WhatsApp back office. |
 | `DASHBOARD_KEY` | Secret in the dashboard URL. Empty disables the dashboard. |
-| `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` | Twilio, for the welcome SMS. Empty = no SMS is ever sent. |
-| `TWILIO_ALPHA_SENDER` | The park's name as the SMS sender ("Valle") where operators show it unregistered. |
-| `TWILIO_FROM` | A Twilio number, the sender everywhere else. |
-| `TWILIO_MESSAGING_SERVICE_SID` | Optional: a Messaging Service that chooses the sender itself (for registered sender IDs). |
-| `SMS_SKIP_COUNTRIES` | Dial prefixes never texted. Empty = the built-in list; `none` = text everyone. |
-| `SMS_ENABLED` | `false` stops SMS without removing the credentials. |
-| `PUBLIC_URL` | Where the bot is reachable, for Twilio's delivery reports. Railway fills it in itself. |
 | `HANDOVER_TIMEOUT_MIN` | Minutes before an unanswered chat returns to the bot. |
 | `OPEN_HOUR`, `CLOSE_HOUR`, `TIMEZONE` | Opening hours used in replies. |
 
@@ -147,40 +140,6 @@ A read-only web view is available at `/dashboard?key=<DASHBOARD_KEY>`: live coun
 waiting queue, captured leads, recent conversations and the latest messages. Photos, voice
 notes, PDFs and videos a guest sends, and files the team sends from the app, are kept in
 the database (up to 12 MB each) and open straight from the conversation viewer.
-
----
-
-## The welcome SMS (Twilio)
-
-A guest who scans the ATM Dubai QR code also gets one text message on their phone, whatever
-their country: a line about the park with the website, sent the moment the WhatsApp welcome
-goes out and never again (`WELCOME_SMS` in `src/notify/sms.js`: one segment, plain Latin on
-purpose). Nobody else is ever texted, and the text can never delay or break the WhatsApp reply:
-it is fired and forgotten, one attempt, with a 15-second timeout.
-
-Who the guest sees as the sender depends on their country (`senderFor`):
-
-- **"Valle"**, an alphanumeric sender (`TWILIO_ALPHA_SENDER`), where operators show it without
-  registration: Mauritius, Réunion, the UK, France, Germany, Italy, Ukraine, Bahrain, Egypt,
-  Pakistan and Kenya.
-- **The Twilio number** (`TWILIO_FROM`) everywhere else. India rewrites it into a random short
-  number; that is normal there.
-- **Skipped, with the reason on the dashboard**: the UAE, Saudi Arabia, Qatar and Kuwait only
-  deliver sender IDs registered with their operators weeks in advance; Russia has no route;
-  Turkey and China block marketing SMS; the USA and Canada block unregistered numbers. Those guests
-  still get the full WhatsApp welcome. `SMS_SKIP_COUNTRIES` replaces the list once a sender ID
-  is registered.
-
-Twilio reports delivery back to `/twilio/status` (signed with the auth token) and the result is
-written into the guest's conversation, so the dashboard shows Sent, Delivered, Failed (with the
-Twilio error explained) or Skipped per guest, in the Excel report and the CSV too.
-
-Setup takes about twenty minutes: `.env.example` walks through it and `scripts/twilio-setup.js`
-does the API side (`status`, `numbers`, `buy`, `service`, `test`). Two things only the console
-can do: enable every destination country under Messaging → Settings → Geo permissions, and
-register sender IDs for the Gulf. Budget roughly USD 0.06 to 0.32 per text depending on the
-country (Mauritius 0.27, UAE 0.12, Saudi Arabia 0.19, India 0.08, the UK 0.06); a $20 balance
-covers about 130 texts, so keep auto-recharge on.
 
 ---
 

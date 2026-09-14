@@ -42,25 +42,6 @@ export const config = {
     maxTokens: Number(process.env.CLAUDE_MAX_TOKENS || 700),
   },
 
-  // Optional: a welcome SMS to guests who scan the ATM Dubai QR code (Twilio).
-  // Empty credentials = no SMS is ever sent, and nothing else changes.
-  sms: {
-    accountSid: process.env.TWILIO_ACCOUNT_SID || '',
-    authToken: process.env.TWILIO_AUTH_TOKEN || '',
-    // Either a Twilio number in E.164, or a Messaging Service (recommended:
-    // it carries the registered sender IDs the Gulf operators require).
-    from: process.env.TWILIO_FROM || '',
-    messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID || '',
-    // The park's name as the sender ("Valle", 11 characters at most), used in
-    // the countries that show it unregistered; see senderFor() in notify/sms.js.
-    alphaSender: (process.env.TWILIO_ALPHA_SENDER || '').trim().slice(0, 11),
-    // Dial prefixes never texted (comma separated). Empty = the built-in list
-    // of countries where a text cannot get through today; "none" = text all.
-    skipCountries: process.env.SMS_SKIP_COUNTRIES || '',
-    // A hard off switch that leaves the credentials in place.
-    enabled: String(process.env.SMS_ENABLED ?? 'true').toLowerCase() === 'true',
-  },
-
   // Optional: the park overview by email (Resend).
   // Empty API key = the bot never offers or sends email.
   email: {
@@ -76,12 +57,6 @@ export const config = {
   // Secret key for the read-only web dashboard (/dashboard?key=...).
   // Empty = dashboard disabled.
   dashboardKey: process.env.DASHBOARD_KEY || '',
-
-  // Where the bot is reachable from the internet, without a trailing slash.
-  // Railway provides its domain; anywhere else set PUBLIC_URL. Handed to third
-  // parties that call us back, such as Twilio's delivery reports.
-  publicUrl: process.env.PUBLIC_URL
-    || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : ''),
 
   db: {
     url: required('DATABASE_URL'),

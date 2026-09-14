@@ -20,7 +20,6 @@ CREATE TABLE IF NOT EXISTS contacts (
   bot_silent      BOOLEAN NOT NULL DEFAULT false,
   email           TEXT,                          -- given by the guest, never by WhatsApp
   email_at        TIMESTAMPTZ,                   -- when the overview was mailed
-  sms_at          TIMESTAMPTZ,                   -- when the welcome SMS went out
   awaiting        TEXT,                          -- what we asked for: 'email' or null
   claimed_by      TEXT,                          -- wa_id of the agent handling it
   claimed_at      TIMESTAMPTZ,
@@ -34,7 +33,6 @@ ALTER TABLE contacts ADD COLUMN IF NOT EXISTS bot_silent BOOLEAN NOT NULL DEFAUL
 -- The one thing WhatsApp never gives us, so the guest has to offer it.
 ALTER TABLE contacts ADD COLUMN IF NOT EXISTS email TEXT;
 ALTER TABLE contacts ADD COLUMN IF NOT EXISTS email_at TIMESTAMPTZ;
-ALTER TABLE contacts ADD COLUMN IF NOT EXISTS sms_at TIMESTAMPTZ;
 -- What we asked the guest for and are still waiting on, e.g. 'email'.
 ALTER TABLE contacts ADD COLUMN IF NOT EXISTS awaiting TEXT;
 

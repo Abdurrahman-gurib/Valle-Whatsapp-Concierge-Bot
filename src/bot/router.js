@@ -4,7 +4,6 @@ import { generateReply } from './ai.js';
 import { handleAdminMessage } from './admin.js';
 import { handleMenuMessage, sendMenuWelcome } from './menu-bot.js';
 import { wantsHuman, needsHuman } from './handover-signals.js';
-import { sendSms, smsEnabled, WELCOME_SMS } from '../notify/sms.js';
 import { sendOverviewEmail, emailEnabled, findEmail } from '../notify/email.js';
 import { sendGallery, hasImages } from './images.js';
 import { sendDoc } from './documents.js';
@@ -38,40 +37,7 @@ const isQrPrefillText = (text) => QR_SOURCES.some((s) => s.match.test((text || '
 /** Marks a chat taken over by a colleague working in the WhatsApp Business app. */
 const APP_AGENT = 'app';
 
-/* ═══════════════ THE SECOND AND THIRD CHANNELS ═══════════════ */
-
-/**
- * A guest who has just scanned gets the same welcome on their phone, once.
- *
- * Fire and forget, deliberately: Twilio is slower than WhatsApp and far less
- * important. The guest must never wait on it, and a Twilio outage must never
- * cost them their WhatsApp reply.
- */
-function welcomeBySms(contact) {
-  if (!smsEnabled() || contact.sms_at) return;
-  sendSms(contact.wa_id, WELCOME_SMS)
-    .then(async (r) => {
-      if (r.ok) {
-        await db.markSmsSent(contact.wa_id);
-        await db.logMessage({
-          contactId: contact.id, direction: 'out', author: 'system', body: `[sms: welcome ${r.sid}]`,
-        });
-      } else if (r.code === 'skipped') {
-        // A country a text cannot reach today (see senderFor): say so, once.
-        await db.logMessage({
-          contactId: contact.id, direction: 'out', author: 'system', body: `[sms: skipped — ${r.hint}]`,
-        });
-      } else if (r.code !== 'disabled') {
-        // The reason lands in the conversation, so the dashboard shows why a
-        // guest has no text: a country not enabled, a STOP, a bad number.
-        await db.logMessage({
-          contactId: contact.id, direction: 'out', author: 'system',
-          body: `[sms: failed ${r.code}${(r.hint || r.message) ? ' — ' + (r.hint || r.message) : ''}]`,
-        });
-      }
-    })
-    .catch((err) => console.error('[router] welcome SMS failed', err.message));
-}
+/* ═══════════════ THE SECOND CHANNEL: EMAIL ═══════════════ */
 
 /** Ask the guest for the address to send the overview to. */
 async function askForEmail(contact) {
@@ -310,10 +276,6 @@ export async function handleIncomingMessage(msg, contactProfile) {
     console.log('[router] silent — no QR code for this contact:', from);
     return;
   }
-
-  // A fresh scan reaches them on both channels: the WhatsApp reply they are
-  // already reading, and the same welcome as a text message on their phone.
-  if (!hadSource && source) welcomeBySms(contact);
 
   /* ---- 2c. A fresh QR scan restarts the concierge ---- */
   // The ATM Dubai message is the one thing that switches the assistant on
