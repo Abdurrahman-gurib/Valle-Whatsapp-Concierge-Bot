@@ -654,6 +654,7 @@ const PAGE = `<!doctype html>
     <div class="panel"><h3>Chats by mode</h3><div class="cv"><canvas id="chMode"></canvas></div></div>
     <div class="panel"><h3>Activity by hour of day · scans and guest messages</h3><div class="cv"><canvas id="chHours"></canvas></div></div>
     <div class="panel"><h3>Guests by country</h3><div class="cv" style="height:240px"><canvas id="chCountry"></canvas></div></div>
+    <div class="panel"><h3>ATM Dubai 2026 guests by country · QR scans only</h3><div class="cv" style="height:240px"><canvas id="chAtmCountry"></canvas></div></div>
     <div class="panel"><h3>Every QR scan · exact date and time</h3><div class="cv"><canvas id="chScanTimes"></canvas></div></div>
     <div class="panel"><h3>Guest messages by type</h3><div class="cv"><canvas id="chTypes"></canvas></div></div>
     <div class="panel" style="grid-column:1/-1"><h3>Conversation load · guests, AI and team per day</h3><div class="cv"><canvas id="chAiTeam"></canvas></div></div>
@@ -859,6 +860,23 @@ function drawCharts() {
       datasets: [{ data: top.map(([, n]) => n), backgroundColor: top.map((_, i) => PALETTE[i % PALETTE.length]), borderRadius: 4 }]},
     options: { ...base, indexAxis: 'y', plugins: { legend: { display: false } },
       scales: { x: { ticks: { precision: 0 } }, y: { grid: { display: false } } } } });
+
+  // The same picture for the ATM Dubai guests only: one bar per country,
+  // counting guests who scanned the QR code; the tooltip adds their scans.
+  const atmByCountry = {};
+  for (const c of (D.atm || [])) {
+    const k = c.country || 'Unrecognised';
+    atmByCountry[k] = atmByCountry[k] || { guests: 0, scans: 0 };
+    atmByCountry[k].guests += 1;
+    atmByCountry[k].scans += Number(c.scans || 0);
+  }
+  const atmTop = Object.entries(atmByCountry).sort((a, b) => b[1].guests - a[1].guests).slice(0, 12);
+  mk('chAtmCountry', { type: 'bar', data: { labels: atmTop.map(([k]) => k),
+      datasets: [{ data: atmTop.map(([, v]) => v.guests), backgroundColor: atmTop.map((_, i) => PALETTE[i % PALETTE.length]), borderRadius: 4 }]},
+    options: { ...base, indexAxis: 'y', plugins: { legend: { display: false }, tooltip: { callbacks: {
+        label: (i) => atmTop[i.dataIndex][1].guests + ' guest' + (atmTop[i.dataIndex][1].guests === 1 ? '' : 's')
+          + ' · ' + atmTop[i.dataIndex][1].scans + ' scan' + (atmTop[i.dataIndex][1].scans === 1 ? '' : 's') } } },
+      scales: { x: { ticks: { precision: 0 }, title: { display: true, text: 'guests' } }, y: { grid: { display: false } } } } });
 
   // Every individual QR scan as a point: the day along the bottom, the exact
   // time of day on the left. The campaign story at a glance.
