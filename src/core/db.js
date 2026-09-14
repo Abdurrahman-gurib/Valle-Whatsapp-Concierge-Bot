@@ -79,7 +79,7 @@ export async function setLang(waId, lang) {
   await q(`UPDATE contacts SET lang = $2 WHERE wa_id = $1`, [waId, lang]);
 }
 
-/* ─────────────── SMS & EMAIL ─────────────── */
+/* ─────────────── EMAIL ─────────────── */
 
 /**
  * What we asked the guest for and have not received yet ('email', or null once
