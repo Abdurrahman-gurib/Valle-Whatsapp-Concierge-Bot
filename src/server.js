@@ -4,6 +4,7 @@ import { verifySignature } from './whatsapp/client.js';
 import { handleIncomingMessage, handleStaffEcho, sweepStaleHandovers } from './bot/router.js';
 import { mountDashboard } from './web/dashboard.js';
 import { pool } from './core/db.js';
+import { forwardStatuses } from './notify/expo-qr.js';
 
 // Timestamp every log line. On 31 Aug a guest's questions went unanswered and
 // the logs could not say when anything happened; never again.
@@ -77,6 +78,8 @@ app.post('/webhook', async (req, res) => {
               console.error('[status] failed', s.recipient_id, JSON.stringify(s.errors));
             }
           }
+          // Expo QR sends from this number too: pass the receipts on (never awaited)
+          forwardStatuses(value.statuses);
         }
 
         // Messages sent FROM the business number, echoed back to us. A message
